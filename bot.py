@@ -1,161 +1,280 @@
 import os
 import time
 import threading
-from datetime import datetime, timedelta
+from collections import deque, defaultdict
 
+import numpy as np
 import pandas as pd
 import alpaca_trade_api as tradeapi
 from flask import Flask, jsonify
 
-API_KEY = os.getenv("APCA_API_KEY_ID")
-SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
+# =========================================================
+# API
+# =========================================================
+api = tradeapi.REST(
+    os.getenv("APCA_API_KEY_ID"),
+    os.getenv("APCA_API_SECRET_KEY"),
+    "https://paper-api.alpaca.markets"
+)
 
-SYMBOL = "AAPL"
-TRADE_QTY = 1
-
-import os
-print("APCA_API_KEY_ID exists:", bool(os.getenv("APCA_API_KEY_ID")))
-print("APCA_API_SECRET_KEY exists:", bool(os.getenv("APCA_API_SECRET_KEY")))
-api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
 app = Flask(__name__)
 
-# -------------------------
-# Trading logic
-# -------------------------
+# =========================================================
+# STATE
+# =========================================================
+paused = False
 
-def get_price_history(symbol):
-    now = datetime.utcnow()
-    past = now - timedelta(minutes=10)
+equity_curve = deque(maxlen=1000)
 
-    bars = api.get_bars(
-        symbol,
-        tradeapi.TimeFrame.Minute,
-        past.isoformat(),
-        now.isoformat()
-    ).df
+# strategy tracking
+strategy_pnl = {
+    "rules": deque(maxlen=200),
+    "ml": deque(maxlen=200)
+}
 
-    return bars
+strategy_weight = {
+    "rules": 0.5,
+    "ml": 0.5
+}
 
-def get_position():
+ml_weights = defaultdict(lambda: np.random.uniform(-0.3, 0.3))
+
+# =========================================================
+# UNIVERSE
+# =========================================================
+SYMBOLS = ["AAPL","MSFT","AMZN","NVDA","META","TSLA","GOOGL","JPM","V","UNH"]
+
+# =========================================================
+# ACCOUNT
+# =========================================================
+def account():
+    return api.get_account()
+
+def equity():
+    return float(account().equity)
+
+def positions():
+    return api.list_positions()
+
+def exposure():
+    eq = equity()
+    used = sum(float(p.market_value) for p in positions())
+    return used / eq
+
+# =========================================================
+# DATA
+# =========================================================
+def get_data(symbol):
+    return api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=80).df
+
+def returns(series, n):
+    return series.iloc[-1] / series.iloc[-n] - 1
+
+# =========================================================
+# REGIME DETECTION (risk engine)
+# =========================================================
+def regime(df):
+    vol = df["close"].pct_change().rolling(20).std().iloc[-1]
+    trend = returns(df["close"], 10)
+
+    if vol > 0.03:
+        return "stress"
+    if trend > 0.01:
+        return "trend_up"
+    if trend < -0.01:
+        return "trend_down"
+    return "neutral"
+
+# =========================================================
+# STRATEGY 1 — RULES
+# =========================================================
+def rules_signal(df):
+    return returns(df["close"], 5) * 0.6 + returns(df["close"], 20) * 0.4
+
+# =========================================================
+# STRATEGY 2 — ML (adaptive weights)
+# =========================================================
+def ml_features(df):
+    return {
+        "r5": returns(df["close"], 5),
+        "r10": returns(df["close"], 10),
+        "r20": returns(df["close"], 20)
+    }
+
+def ml_signal(symbol, df):
+    f = ml_features(df)
+    return sum(f[k] * ml_weights[f"{symbol}_{k}"] for k in f)
+
+def ml_learn(symbol, df, reward):
+    f = ml_features(df)
+    for k in f:
+        ml_weights[f"{symbol}_{k}"] += 0.01 * reward * f[k]
+
+# =========================================================
+# POSITION SIZING (risk-aware)
+# =========================================================
+def position_size(signal, df):
+    eq = equity()
+
+    vol = df["close"].pct_change().rolling(20).std().iloc[-1]
+    reg = regime(df)
+
+    base_risk = 0.01
+
+    if reg == "stress":
+        base_risk *= 0.3
+    elif reg == "trend_up":
+        base_risk *= 1.2
+
+    risk_budget = eq * base_risk * abs(signal)
+
+    stop = max(vol * 2, 0.02)
+
+    return max(int(risk_budget / stop), 0)
+
+# =========================================================
+# EXECUTION
+# =========================================================
+def position(symbol):
     try:
-        position = api.get_position(SYMBOL)
-        return float(position.avg_entry_price), int(position.qty)
+        p = api.get_position(symbol)
+        return float(p.avg_entry_price), int(p.qty)
     except:
         return None, 0
 
-def buy():
-    print("📈 BUY")
-    api.submit_order(
-        symbol=SYMBOL,
-        qty=TRADE_QTY,
-        side="buy",
-        type="market",
-        time_in_force="gtc"
-    )
+def trade(symbol, signal, df):
+    entry, qty = position(symbol)
+    price = df["close"].iloc[-1]
 
-def sell():
-    print("📉 SELL")
-    api.submit_order(
-        symbol=SYMBOL,
-        qty=TRADE_QTY,
-        side="sell",
-        type="market",
-        time_in_force="gtc"
-    )
+    # ENTRY
+    if qty == 0 and signal > 0.5:
+        size = position_size(signal, df)
+        if size > 0:
+            api.submit_order(symbol, size, "buy", "market", "gtc")
 
-def run_strategy():
-    bars = get_price_history(SYMBOL)
+    # EXIT
+    if qty > 0:
+        pnl = (price - entry) / entry
 
-    if len(bars) < 5:
-        return
+        if pnl < -0.02:
+            api.submit_order(symbol, qty, "sell", "market", "gtc")
 
-    recent = bars.tail(5)
-    old_price = recent["close"].iloc[0]
-    current_price = recent["close"].iloc[-1]
+        if pnl > 0.18:
+            api.submit_order(symbol, qty, "sell", "market", "gtc")
 
-    change_pct = ((current_price - old_price) / old_price) * 100
+# =========================================================
+# ENGINE LOOP
+# =========================================================
+def engine():
+    global paused
 
-    entry_price, qty = get_position()
-
-    print(f"{datetime.utcnow()} | {current_price:.2f} | {change_pct:.2f}%")
-
-    if qty == 0:
-        if change_pct <= -1.0:
-            buy()
-    else:
-        profit_pct = ((current_price - entry_price) / entry_price) * 100
-
-        if profit_pct >= 1.5 or profit_pct <= -2.0:
-            sell()
-
-def trading_loop():
     while True:
-        try:
-            run_strategy()
-        except Exception as e:
-            print(f"Trading error: {e}")
+        if paused:
+            time.sleep(2)
+            continue
+
+        for s in SYMBOLS:
+            df = get_data(s)
+            if len(df) < 40:
+                continue
+
+            r = rules_signal(df)
+            m = ml_signal(s, df)
+
+            # ensemble allocation
+            signal = strategy_weight["rules"] * r + strategy_weight["ml"] * m
+
+            trade(s, signal, df)
+
+            reward = returns(df["close"], 3)
+            ml_learn(s, df, reward)
+
+        equity_curve.append(equity())
+
+        time.sleep(120)
+
+# =========================================================
+# WALK-FORWARD EVALUATION (LIVE PROXY BACKTEST)
+# =========================================================
+def evaluate():
+    while True:
+        if len(equity_curve) < 100:
+            time.sleep(60)
+            continue
+
+        recent = list(equity_curve)[-100:]
+
+        growth = recent[-1] - recent[0]
+        volatility = np.std(recent)
+
+        score = growth / (volatility + 1e-9)
+
+        # adapt weights
+        if score < 0:
+            strategy_weight["ml"] += 0.05
+            strategy_weight["rules"] -= 0.05
+        else:
+            strategy_weight["rules"] += 0.03
+            strategy_weight["ml"] -= 0.03
+
+        # clamp
+        strategy_weight["rules"] = min(max(strategy_weight["rules"], 0.1), 0.9)
+        strategy_weight["ml"] = 1 - strategy_weight["rules"]
+
+        time.sleep(300)
+
+# =========================================================
+# DRAW DOWN PROTECTION (IMPORTANT)
+# =========================================================
+def drawdown_guard():
+    peak = 0
+
+    while True:
+        eq = equity()
+        global paused
+
+        if eq > peak:
+            peak = eq
+
+        dd = (peak - eq) / peak
+
+        if dd > 0.08:
+            paused = True
+        elif dd < 0.03:
+            paused = False
 
         time.sleep(60)
 
-# -------------------------
-# Reporting API
-# -------------------------
-
+# =========================================================
+# API
+# =========================================================
 @app.route("/status")
 def status():
-    account = api.get_account()
-    equity = float(account.equity)
-    cash = float(account.cash)
-
+    acc = account()
     return jsonify({
-        "equity": equity,
-        "cash": cash,
-        "timestamp": datetime.utcnow().isoformat()
+        "equity": float(acc.equity),
+        "cash": float(acc.cash),
+        "weights": strategy_weight,
+        "paused": paused
     })
 
-@app.route("/report")
-def report():
-    account = api.get_account()
-    positions = api.list_positions()
-    activities = api.get_activities()
+@app.route("/regime")
+def get_regime():
+    df = get_data("AAPL")
+    return {"regime": regime(df)}
 
-    pos_data = []
-    for p in positions:
-        pos_data.append({
-            "symbol": p.symbol,
-            "qty": int(p.qty),
-            "avg_entry_price": float(p.avg_entry_price),
-            "current_price": float(p.current_price),
-            "unrealized_pl": float(p.unrealized_pl)
-        })
+@app.route("/weights")
+def weights():
+    return dict(strategy_weight)
 
-    trades = []
-    for a in activities[:20]:  # last 20 trades
-        trades.append({
-            "symbol": a.symbol,
-            "side": a.side,
-            "qty": a.qty,
-            "price": a.price,
-            "date": a.transaction_time
-        })
-
-    return jsonify({
-        "equity": float(account.equity),
-        "cash": float(account.cash),
-        "positions": pos_data,
-        "recent_trades": trades
-    })
-
-# -------------------------
-# Main
-# -------------------------
-
+# =========================================================
+# MAIN
+# =========================================================
 if __name__ == "__main__":
-    print("🚀 Bot + API running")
+    print("🚀 Quant v5 production system starting")
 
-    t = threading.Thread(target=trading_loop)
-    t.start()
+    threading.Thread(target=engine, daemon=True).start()
+    threading.Thread(target=evaluate, daemon=True).start()
+    threading.Thread(target=drawdown_guard, daemon=True).start()
 
-    port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
