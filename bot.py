@@ -42,7 +42,18 @@ ml_weights = defaultdict(lambda: np.random.uniform(-0.3, 0.3))
 # =========================================================
 # UNIVERSE
 # =========================================================
-SYMBOLS = ["AAPL","MSFT","AMZN","NVDA","META","TSLA","GOOGL","JPM","V","UNH"]
+SYMBOLS = [
+    "AAPL", "MSFT", "AMZN", "GOOGL", "GOOG",
+    "META", "NVDA", "TSLA", "BRK.B", "JPM",
+    "V", "UNH", "HD", "PG", "MA",
+    "DIS", "BAC", "XOM", "AVGO", "LLY",
+    "ADBE", "COST", "PEP", "KO", "CRM",
+    "MRK", "ABT", "CVX", "TMO", "WMT",
+    "CSCO", "MCD", "ACN", "DHR", "AMD",
+    "TXN", "NEE", "LIN", "PM", "UPS",
+    "ORCL", "BMY", "QCOM", "LOW", "INTC",
+    "SPGI", "CAT", "GS", "MS", "BLK"
+]
 
 # =========================================================
 # ACCOUNT
@@ -266,6 +277,88 @@ def get_regime():
 @app.route("/weights")
 def weights():
     return dict(strategy_weight)
+
+@app.route("/report")
+def report():
+    acc = api.get_account()
+    pos = api.list_positions()
+
+    positions = []
+    for p in pos:
+        positions.append({
+            "symbol": p.symbol,
+            "qty": int(p.qty),
+            "avg_entry": float(p.avg_entry_price),
+            "current_price": float(p.current_price),
+            "market_value": float(p.market_value),
+            "unrealized_pl": float(p.unrealized_pl)
+        })
+
+    return jsonify({
+        "equity": float(acc.equity),
+        "cash": float(acc.cash),
+        "buying_power": float(acc.buying_power),
+        "positions": positions
+    })
+
+equity_curve = []  # make sure your engine appends here
+
+@app.route("/performance")
+def performance():
+    if len(equity_curve) < 10:
+        return jsonify({"error": "not enough data"})
+
+    curve = np.array(equity_curve)
+
+    returns = np.diff(curve) / curve[:-1]
+    total_return = (curve[-1] / curve[0]) - 1
+
+    volatility = np.std(returns)
+    sharpe = np.mean(returns) / (volatility + 1e-9)
+
+    peak = np.maximum.accumulate(curve)
+    drawdown = (curve - peak) / peak
+    max_dd = np.min(drawdown)
+
+    return jsonify({
+        "total_return": float(total_return),
+        "volatility": float(volatility),
+        "sharpe": float(sharpe),
+        "max_drawdown": float(max_dd)
+    })
+    
+@app.route("/ml_state")
+def ml_state():
+    sample = dict(list(ml_weights.items())[:20])
+
+    return jsonify({
+        "strategy_weights": strategy_weight,
+        "ml_sample_weights": sample
+    })
+
+@app.route("/debug/signal/<symbol>")
+def debug_signal(symbol):
+    df = get_data(symbol)
+
+    if len(df) < 40:
+        return jsonify({"error": "not enough data"})
+
+    r = rules_signal(df)
+    m = ml_signal(symbol, df)
+
+    combined = strategy_weight["rules"] * r + strategy_weight["ml"] * m
+
+    reg = regime(df)
+
+    return jsonify({
+        "symbol": symbol,
+        "rules_signal": float(r),
+        "ml_signal": float(m),
+        "combined_signal": float(combined),
+        "regime": reg,
+        "ml_weight_rules": strategy_weight["rules"],
+        "ml_weight_ml": strategy_weight["ml"]
+    })
 
 # =========================================================
 # MAIN
