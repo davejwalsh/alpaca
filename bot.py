@@ -8,6 +8,8 @@ import pandas as pd
 import alpaca_trade_api as tradeapi
 from flask import Flask, jsonify
 
+print("🔥 FILE STARTED")
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -134,19 +136,15 @@ def trade(symbol, signal, df):
         first_trade_done = True
         return
 
-    # ENTRY (relaxed in debug)
     threshold = 0.1 if DEBUG_MODE else 0.5
 
     if qty == 0 and signal > threshold:
         size = 1 if DEBUG_MODE else int(100 * abs(signal))
-
         print(f"✅ BUY {symbol} size={size}")
         api.submit_order(symbol, size, "buy", "market", "gtc")
 
-    # EXIT
     if qty > 0:
         pnl = (price - entry) / entry
-
         print(f"💰 {symbol} PnL={pnl:.3f}")
 
         if pnl < -0.02:
@@ -185,7 +183,6 @@ def engine():
 
                 r = rules_signal(df)
                 m = ml_signal(s, df)
-
                 signal = strategy_weight["rules"] * r + strategy_weight["ml"] * m
 
                 print(f"🔍 {s} | rules={r:.4f} ml={m:.4f} combined={signal:.4f}")
@@ -200,14 +197,27 @@ def engine():
 
         eq = equity()
         equity_curve.append(eq)
-
         print(f"💼 Equity: {eq}")
 
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
+# SAFE STARTUP (CRITICAL FIX)
+# =========================================================
+def start_background():
+    print("⏳ Delaying engine start (Railway health check)...")
+    time.sleep(5)  # <-- critical for Railway
+
+    print("🚀 Starting engine thread")
+    threading.Thread(target=engine, daemon=True).start()
+
+# =========================================================
 # API
 # =========================================================
+@app.route("/")
+def home():
+    return {"status": "ok"}
+
 @app.route("/status")
 def status():
     acc = api.get_account()
@@ -228,16 +238,13 @@ def report():
         "positions": [p.symbol for p in pos]
     })
 
-@app.route("/")
-def home():
-    return {"status": "bot running"}
-
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
     print("🚀 DEBUG MODE ACTIVE")
 
-    threading.Thread(target=engine, daemon=True).start()
+    # start background AFTER flask is ready
+    threading.Thread(target=start_background, daemon=True).start()
 
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
