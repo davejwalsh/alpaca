@@ -4,73 +4,70 @@ import threading
 from datetime import datetime, timedelta
 
 import pandas as pd
+import alpaca_trade_api as tradeapi
 from flask import Flask, jsonify
-from ib_insync import *
 
-app = Flask(__name__)
-
-# -------------------------
-# IBKR Setup
-# -------------------------
-
-ib = IB()
-ib.connect("127.0.0.1", 7497, clientId=1)
+API_KEY = os.getenv("APCA_API_KEY_ID")
+SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"
 
 SYMBOL = "AAPL"
 TRADE_QTY = 1
 
-contract = Stock(SYMBOL, "SMART", "USD")
+api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
+app = Flask(__name__)
 
 # -------------------------
-# Helpers
+# Trading logic
 # -------------------------
 
-def get_price_history():
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr='10 M',
-        barSizeSetting='1 min',
-        whatToShow='TRADES',
-        useRTH=True
-    )
+def get_price_history(symbol):
+    now = datetime.utcnow()
+    past = now - timedelta(minutes=10)
 
-    df = util.df(bars)
-    return df
+    bars = api.get_bars(
+        symbol,
+        tradeapi.TimeFrame.Minute,
+        past.isoformat(),
+        now.isoformat()
+    ).df
+
+    return bars
 
 def get_position():
-    positions = ib.positions()
-    for p in positions:
-        if p.contract.symbol == SYMBOL:
-            return p.avgCost, p.position
-    return None, 0
-
-def get_current_price():
-    ticker = ib.reqMktData(contract, "", False, False)
-    ib.sleep(2)
-    return ticker.last
+    try:
+        position = api.get_position(SYMBOL)
+        return float(position.avg_entry_price), int(position.qty)
+    except:
+        return None, 0
 
 def buy():
     print("📈 BUY")
-    order = MarketOrder("BUY", TRADE_QTY)
-    ib.placeOrder(contract, order)
+    api.submit_order(
+        symbol=SYMBOL,
+        qty=TRADE_QTY,
+        side="buy",
+        type="market",
+        time_in_force="gtc"
+    )
 
 def sell():
     print("📉 SELL")
-    order = MarketOrder("SELL", TRADE_QTY)
-    ib.placeOrder(contract, order)
-
-# -------------------------
-# Strategy
-# -------------------------
+    api.submit_order(
+        symbol=SYMBOL,
+        qty=TRADE_QTY,
+        side="sell",
+        type="market",
+        time_in_force="gtc"
+    )
 
 def run_strategy():
-    df = get_price_history()
+    bars = get_price_history(SYMBOL)
 
-    if len(df) < 5:
+    if len(bars) < 5:
         return
 
-    recent = df.tail(5)
+    recent = bars.tail(5)
     old_price = recent["close"].iloc[0]
     current_price = recent["close"].iloc[-1]
 
@@ -104,10 +101,9 @@ def trading_loop():
 
 @app.route("/status")
 def status():
-    account_values = ib.accountSummary()
-
-    equity = next((float(v.value) for v in account_values if v.tag == "NetLiquidation"), 0)
-    cash = next((float(v.value) for v in account_values if v.tag == "AvailableFunds"), 0)
+    account = api.get_account()
+    equity = float(account.equity)
+    cash = float(account.cash)
 
     return jsonify({
         "equity": equity,
@@ -117,29 +113,35 @@ def status():
 
 @app.route("/report")
 def report():
-    positions = ib.positions()
-    trades = ib.trades()
+    account = api.get_account()
+    positions = api.list_positions()
+    activities = api.get_activities()
 
     pos_data = []
     for p in positions:
         pos_data.append({
-            "symbol": p.contract.symbol,
-            "qty": p.position,
-            "avg_cost": p.avgCost
+            "symbol": p.symbol,
+            "qty": int(p.qty),
+            "avg_entry_price": float(p.avg_entry_price),
+            "current_price": float(p.current_price),
+            "unrealized_pl": float(p.unrealized_pl)
         })
 
-    trade_data = []
-    for t in trades[-20:]:
-        trade_data.append({
-            "symbol": t.contract.symbol,
-            "action": t.order.action,
-            "qty": t.order.totalQuantity,
-            "status": t.orderStatus.status
+    trades = []
+    for a in activities[:20]:  # last 20 trades
+        trades.append({
+            "symbol": a.symbol,
+            "side": a.side,
+            "qty": a.qty,
+            "price": a.price,
+            "date": a.transaction_time
         })
 
     return jsonify({
+        "equity": float(account.equity),
+        "cash": float(account.cash),
         "positions": pos_data,
-        "recent_trades": trade_data
+        "recent_trades": trades
     })
 
 # -------------------------
@@ -147,7 +149,7 @@ def report():
 # -------------------------
 
 if __name__ == "__main__":
-    print("🚀 IBKR Bot running")
+    print("🚀 Bot + API running")
 
     t = threading.Thread(target=trading_loop)
     t.start()
