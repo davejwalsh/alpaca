@@ -14,6 +14,9 @@ BASE_URL = "https://paper-api.alpaca.markets"
 SYMBOL = "AAPL"
 TRADE_QTY = 1
 
+import os
+print("APCA_API_KEY_ID exists:", bool(os.getenv("APCA_API_KEY_ID")))
+print("APCA_API_SECRET_KEY exists:", bool(os.getenv("APCA_API_SECRET_KEY")))
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
 app = Flask(__name__)
 
