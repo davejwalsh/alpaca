@@ -4,17 +4,21 @@ import threading
 from collections import deque, defaultdict
 
 import numpy as np
-import pandas as pd
 import alpaca_trade_api as tradeapi
 from flask import Flask, jsonify
 
-print("🔥 FILE STARTED")
+print("🔥 HEDGE FUND BOT STARTING")
 
 # =========================================================
 # CONFIG
 # =========================================================
 DEBUG_MODE = True
 CHECK_INTERVAL = 30
+COOLDOWN = 300
+
+MAX_POSITIONS = 12
+MAX_EXPOSURE = 0.80
+MIN_SIGNAL = 0.02
 
 # =========================================================
 # API
@@ -31,15 +35,10 @@ app = Flask(__name__)
 # STATE
 # =========================================================
 paused = False
-first_trade_done = False
-
 equity_curve = deque(maxlen=1000)
+last_trade_time = {}
 
-strategy_weight = {
-    "rules": 0.5,
-    "ml": 0.5
-}
-
+strategy_weight = {"rules": 0.5, "ml": 0.5}
 ml_weights = defaultdict(lambda: np.random.uniform(-0.3, 0.3))
 
 # =========================================================
@@ -54,13 +53,20 @@ SYMBOLS = [
 ]
 
 # =========================================================
-# ACCOUNT
+# ACCOUNT HELPERS
 # =========================================================
 def equity():
     return float(api.get_account().equity)
 
 def positions():
     return api.list_positions()
+
+def position(symbol):
+    try:
+        p = api.get_position(symbol)
+        return float(p.avg_entry_price), int(p.qty)
+    except:
+        return None, 0
 
 # =========================================================
 # DATA
@@ -70,21 +76,6 @@ def get_data(symbol):
 
 def returns(series, n):
     return series.iloc[-1] / series.iloc[-n] - 1
-
-# =========================================================
-# REGIME
-# =========================================================
-def regime(df):
-    vol = df["close"].pct_change().rolling(20).std().iloc[-1]
-    trend = returns(df["close"], 10)
-
-    if vol > 0.03:
-        return "stress"
-    if trend > 0.01:
-        return "trend_up"
-    if trend < -0.01:
-        return "trend_down"
-    return "neutral"
 
 # =========================================================
 # SIGNALS
@@ -109,114 +100,143 @@ def ml_learn(symbol, df, reward):
         ml_weights[f"{symbol}_{k}"] += 0.01 * reward * f[k]
 
 # =========================================================
-# POSITION
-# =========================================================
-def position(symbol):
-    try:
-        p = api.get_position(symbol)
-        return float(p.avg_entry_price), int(p.qty)
-    except:
-        return None, 0
-
-# =========================================================
-# EXECUTION
-# =========================================================
-def trade(symbol, signal, df):
-    global first_trade_done
-
-    entry, qty = position(symbol)
-    price = df["close"].iloc[-1]
-
-    print(f"📊 {symbol} | signal={signal:.4f} | price={price:.2f}")
-
-    # FORCE TEST TRADE
-    if DEBUG_MODE and not first_trade_done:
-        print("🚀 FORCED TEST TRADE")
-        api.submit_order(symbol="AAPL", qty=1, side="buy", type="market", time_in_force="gtc")
-        first_trade_done = True
-        return
-
-    threshold = 0.1 if DEBUG_MODE else 0.5
-
-    if qty == 0 and signal > threshold:
-        size = 1 if DEBUG_MODE else int(100 * abs(signal))
-        print(f"✅ BUY {symbol} size={size}")
-        api.submit_order(symbol, size, "buy", "market", "gtc")
-
-    if qty > 0:
-        pnl = (price - entry) / entry
-        print(f"💰 {symbol} PnL={pnl:.3f}")
-
-        if pnl < -0.02:
-            print(f"🛑 STOP LOSS {symbol}")
-            api.submit_order(symbol, qty, "sell", "market", "gtc")
-
-        elif pnl > 0.05 and DEBUG_MODE:
-            print(f"🎯 QUICK TAKE PROFIT {symbol}")
-            api.submit_order(symbol, qty, "sell", "market", "gtc")
-
-        elif pnl > 0.18:
-            print(f"🏆 FULL TAKE PROFIT {symbol}")
-            api.submit_order(symbol, qty, "sell", "market", "gtc")
-
-# =========================================================
-# ENGINE
+# ENGINE (PORTFOLIO ALLOCATOR)
 # =========================================================
 def engine():
     global paused
 
     while True:
-        print("\n🔁 NEW SCAN CYCLE")
+        print("\n🔁 PORTFOLIO CYCLE")
 
         if paused:
             print("⏸️ PAUSED")
             time.sleep(5)
             continue
 
+        acc = api.get_account()
+        eq = float(acc.equity)
+
+        current_positions = {p.symbol: p for p in positions()}
+        current_exposure = sum(float(p.market_value) for p in current_positions.values()) / eq
+
+        scored = []
+
+        # =====================================================
+        # SCAN UNIVERSE
+        # =====================================================
         for s in SYMBOLS:
             try:
                 df = get_data(s)
 
                 if len(df) < 40:
-                    print(f"⚠️ Not enough data for {s}")
                     continue
 
                 r = rules_signal(df)
                 m = ml_signal(s, df)
-                signal = strategy_weight["rules"] * r + strategy_weight["ml"] * m
 
-                print(f"🔍 {s} | rules={r:.4f} ml={m:.4f} combined={signal:.4f}")
+                raw_signal = strategy_weight["rules"] * r + strategy_weight["ml"] * m
+                momentum = returns(df["close"], 1)
 
-                trade(s, signal, df)
+                vol = df["close"].pct_change().rolling(20).std().iloc[-1]
+                vol = max(vol, 1e-6)
 
-                reward = returns(df["close"], 3)
-                ml_learn(s, df, reward)
+                signal = (raw_signal + momentum * 0.3) / vol
+
+                if abs(signal) < MIN_SIGNAL:
+                    continue
+
+                scored.append((s, signal, df, vol))
 
             except Exception as e:
-                print(f"❌ ERROR {s}: {e}")
+                print(f"❌ {s}: {e}")
 
-        eq = equity()
+        if not scored:
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        # =====================================================
+        # RANK OPPORTUNITIES
+        # =====================================================
+        scored.sort(key=lambda x: abs(x[1]), reverse=True)
+        top = scored[:MAX_POSITIONS]
+
+        print(f"📊 TOP: {[x[0] for x in top]}")
+
+        available_capital = max(0, (MAX_EXPOSURE - current_exposure)) * eq
+
+        if available_capital <= 0:
+            print("⚠️ Fully invested")
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        total_strength = sum(abs(x[1]) for x in top)
+
+        # =====================================================
+        # TRADE PORTFOLIO
+        # =====================================================
+        for symbol, signal, df, vol in top:
+
+            price = df["close"].iloc[-1]
+            entry, qty = position(symbol)
+
+            weight = abs(signal) / total_strength if total_strength else 0
+            allocation = available_capital * weight
+
+            size = int(allocation / (price * vol))
+            size = max(0, min(size, 10))
+
+            print(f"📌 {symbol} sig={signal:.3f} size={size}")
+
+            now = time.time()
+
+            # =================================================
+            # ENTRY
+            # =================================================
+            if qty == 0 and signal > 0 and size > 0:
+
+                if symbol in last_trade_time:
+                    if now - last_trade_time[symbol] < COOLDOWN:
+                        continue
+
+                print(f"🟢 BUY {symbol} size={size}")
+                api.submit_order(symbol, size, "buy", "market", "gtc")
+                last_trade_time[symbol] = now
+
+            # =================================================
+            # EXIT
+            # =================================================
+            if qty > 0:
+                entry_price = float(entry)
+                pnl = (price - entry_price) / entry_price
+
+                if pnl < -0.02:
+                    print(f"🛑 STOP {symbol}")
+                    api.submit_order(symbol, qty, "sell", "market", "gtc")
+
+                elif pnl > 0.08:
+                    print(f"📉 TAKE 8% {symbol}")
+                    api.submit_order(symbol, max(1, qty // 2), "sell", "market", "gtc")
+
+                elif pnl > 0.15:
+                    print(f"📉 TAKE 15% {symbol}")
+                    api.submit_order(symbol, max(1, qty // 2), "sell", "market", "gtc")
+
+                elif pnl > 0.30:
+                    print(f"🏆 EXIT {symbol}")
+                    api.submit_order(symbol, qty, "sell", "market", "gtc")
+
         equity_curve.append(eq)
-        print(f"💼 Equity: {eq}")
+
+        print(f"💼 EQUITY: {eq:.2f} | EXP: {current_exposure:.2f}")
 
         time.sleep(CHECK_INTERVAL)
-
-# =========================================================
-# SAFE STARTUP (CRITICAL FIX)
-# =========================================================
-def start_background():
-    print("⏳ Delaying engine start (Railway health check)...")
-    time.sleep(5)  # <-- critical for Railway
-
-    print("🚀 Starting engine thread")
-    threading.Thread(target=engine, daemon=True).start()
 
 # =========================================================
 # API
 # =========================================================
 @app.route("/")
 def home():
-    return {"status": "ok"}
+    return {"status": "running"}
 
 @app.route("/status")
 def status():
@@ -224,52 +244,29 @@ def status():
     return jsonify({
         "equity": float(acc.equity),
         "cash": float(acc.cash),
-        "weights": strategy_weight,
         "paused": paused
     })
 
 @app.route("/report")
 def report():
-    acc = api.get_account()
     pos = api.list_positions()
-
     return jsonify({
-        "equity": float(acc.equity),
-        "positions": [p.symbol for p in pos]
+        "positions": [p.symbol for p in pos],
+        "count": len(pos)
     })
-@app.route("/trades")
-def trades():
-    try:
-        activities = api.get_activities(activity_types="FILL")
 
-        trades = []
-        for a in activities[:20]:  # last 20 trades
-            trades.append({
-                "symbol": a.symbol,
-                "side": a.side,
-                "qty": a.qty,
-                "price": a.price,
-                "time": a.transaction_time
-            })
-
-        return jsonify(trades)
-
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.route("/equity-history")
-def equity_history():
-    return {
-        "equity": list(equity_curve)
-    }
+@app.route("/equity")
+def equity_api():
+    return {"equity": list(equity_curve)}
 
 # =========================================================
-# MAIN
+# START
 # =========================================================
+def start():
+    time.sleep(5)
+    threading.Thread(target=engine, daemon=True).start()
+
 if __name__ == "__main__":
-    print("🚀 DEBUG MODE ACTIVE")
-
-    # start background AFTER flask is ready
-    threading.Thread(target=start_background, daemon=True).start()
-
+    print("🚀 STARTING HEDGE FUND BOT")
+    threading.Thread(target=start, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
