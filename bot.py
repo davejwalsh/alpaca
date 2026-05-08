@@ -6,7 +6,10 @@ from collections import deque, defaultdict
 import numpy as np
 import pandas as pd
 import alpaca_trade_api as tradeapi
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file
+
+import matplotlib.pyplot as plt
+import io
 
 print("🔥 FILE STARTED")
 
@@ -237,6 +240,49 @@ def report():
         "equity": float(acc.equity),
         "positions": [p.symbol for p in pos]
     })
+@app.route("/trades")
+def trades():
+    try:
+        activities = api.get_activities(activity_types="FILL")
+
+        trades = []
+        for a in activities[:20]:  # last 20 trades
+            trades.append({
+                "symbol": a.symbol,
+                "side": a.side,
+                "qty": a.qty,
+                "price": a.price,
+                "time": a.transaction_time
+            })
+
+        return jsonify(trades)
+
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.route("/equity-graph.png")
+def equity_graph():
+    if len(equity_curve) < 5:
+        return {"error": "not enough data"}
+
+    plt.figure()
+    plt.plot(list(equity_curve))
+    plt.title("Equity Curve")
+    plt.xlabel("Time")
+    plt.ylabel("Equity")
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    plt.close()
+
+    return send_file(buf, mimetype="image/png")
+
+@app.route("/equity-history")
+def equity_history():
+    return {
+        "equity": list(equity_curve)
+    }
 
 # =========================================================
 # MAIN
