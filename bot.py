@@ -6,7 +6,7 @@ from collections import deque, defaultdict
 import numpy as np
 import pandas as pd
 import alpaca_trade_api as tradeapi
-from flask import Flask
+from flask import Flask, jsonify
 
 print("🏛️ MICRO-QUANT v11 (WALK-FORWARD RESEARCH CORE)")
 
@@ -336,7 +336,11 @@ def home():
 
 @app.route("/equity")
 def eq():
-    return list(equity_curve)
+    return {"equity": list(equity_curve)}
+
+def cash_api():
+def cs():
+    return {"cash": list(cash_curve)}
 
 
 @app.route("/orders")
@@ -358,7 +362,14 @@ def portfolio():
         }
         for p in positions()
     ])
+    
+@app.route("/ml")
+def ml_state():
+    return {
+        "sample_weights": dict(list(ml_weights.items())[:30])
+    }
 
+@app.route("/status")
 def status():
     acc = api.get_account()
     return jsonify({
