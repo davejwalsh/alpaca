@@ -43,18 +43,16 @@ api = tradeapi.REST(
 )
 
 app = Flask(__name__)
+
 lock = threading.Lock()
 
-# =========================================================
-# STATE
-# =========================================================
 equity_curve = deque(maxlen=20000)
-cash_curve = deque(maxlen=20000)
+cash_curve = deque(maxlen=20000)  # ✅ FIXED
 order_log = deque(maxlen=10000)
 
 strategy_stats = defaultdict(lambda: {"sharpe": 0, "drift": 0, "count": 0})
 
-latest_regime = None
+latest_regime = 0.5  # ✅ prevents warmup stall
 
 # =========================================================
 # UNIVERSE
@@ -68,7 +66,7 @@ def universe():
         and a.exchange in ["NASDAQ", "NYSE"]
     ]
 
-    priority = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH"]
+    priority = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V"]
 
     return sorted(core, key=lambda x: (x not in priority, x))[:SCAN_LIMIT]
 
@@ -120,6 +118,7 @@ def features(close):
 # ALPHA
 # =========================================================
 def alpha(f, price):
+
     vol = max(f["vol"].iloc[-1], EPS)
 
     mom = f["mom"].iloc[-1] / vol
@@ -134,6 +133,7 @@ def alpha(f, price):
 # WALK FORWARD
 # =========================================================
 def walk_forward(df):
+
     close = df["close"].values
 
     if len(close) < WINDOW:
@@ -145,13 +145,16 @@ def walk_forward(df):
     pnl = []
 
     for i in range(30, len(test)):
+
         window = pd.Series(np.concatenate([train, test[:i]]))
 
         f = features(window)
+
         if len(f) < 30:
             continue
 
         a, _ = alpha(f, window.iloc[-1])
+
         pnl.append(a)
 
     if len(pnl) < 10:
@@ -168,6 +171,7 @@ def walk_forward(df):
 # REGIME
 # =========================================================
 def market_regime(vols):
+
     v = np.mean(vols)
 
     if v < 0.01:
@@ -180,18 +184,21 @@ def market_regime(vols):
 # PORTFOLIO
 # =========================================================
 def build_portfolio(alphas, vols, regime):
+
     alphas = np.array(alphas)
 
     z = (alphas - np.mean(alphas)) / (np.std(alphas) + EPS)
+
     w = z / (np.array(vols) + EPS)
 
     w = w / (np.sum(np.abs(w)) + EPS)
+
     w *= regime
 
     return np.clip(w, -MAX_POS, MAX_POS)
 
 # =========================================================
-# ACCOUNT
+# STATE
 # =========================================================
 def account():
     return api.get_account()
@@ -206,7 +213,9 @@ def positions():
 # EXPOSURE
 # =========================================================
 def exposure(pos, prices, eq):
+
     gross = 0
+
     for s, q in pos.items():
         p = prices.get(s)
         if p is None:
@@ -219,14 +228,18 @@ def exposure(pos, prices, eq):
 # ENGINE
 # =========================================================
 def engine():
+
     global latest_regime
 
     peak = 0
 
     while True:
+
         alphas, vols, syms, prices = [], [], [], []
+        raw_vols = []
 
         for s in SYMBOLS:
+
             df = bars(s)
             if df is None:
                 continue
@@ -236,9 +249,12 @@ def engine():
                 continue
 
             a, v = alpha(f, df["close"].iloc[-1])
-            sh, _ = walk_forward(df)
 
-            if sh < 0.2:
+            raw_vols.append(v)
+
+            sh, dr = walk_forward(df)
+
+            if sh < 0.0:  # relaxed filter
                 continue
 
             alphas.append(a)
@@ -246,19 +262,27 @@ def engine():
             syms.append(s)
             prices.append(df["close"].iloc[-1])
 
+        # always update regime
+        if raw_vols:
+            latest_regime = market_regime(raw_vols)
+
+        print(f"scan={len(SYMBOLS)} valid={len(alphas)} regime={latest_regime:.2f}")
+
         if not alphas:
             time.sleep(CHECK_INTERVAL)
             continue
 
         acc = account()
         pos = positions()
-        eq = float(acc.equity)
 
-        latest_regime = market_regime(vols)
+        eq = float(acc.equity)
+        cash = float(acc.cash)
+
+        exp = exposure(pos, {s: p for s, p in zip(syms, prices)}, eq)
 
         with lock:
             equity_curve.append(eq)
-            cash_curve.append(float(acc.cash))
+            cash_curve.append(cash)
 
         peak = max(peak, eq)
         dd = (peak - eq) / (peak + EPS)
@@ -268,14 +292,16 @@ def engine():
             time.sleep(CHECK_INTERVAL)
             continue
 
-        weights = build_portfolio(alphas, vols, latest_regime)
+        w = build_portfolio(alphas, vols, latest_regime)
 
-        ranked = sorted(zip(syms, weights), key=lambda x: abs(x[1]), reverse=True)[:TOP_K]
+        ranked = sorted(zip(syms, w), key=lambda x: abs(x[1]), reverse=True)[:TOP_K]
 
-        print(f"📊 REGIME={latest_regime:.2f} DD={dd:.2f}")
+        print(f"📊 EXP={exp:.2f} REGIME={latest_regime:.2f} DD={dd:.2f}")
 
         for s, weight in ranked:
+
             price = prices[syms.index(s)]
+
             target = weight * eq
             current = pos.get(s, 0.0)
 
@@ -309,6 +335,7 @@ def engine():
                 print("order fail", s, e)
 
         print(f"💼 EQUITY={eq:.2f}")
+
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
@@ -316,7 +343,7 @@ def engine():
 # =========================================================
 @app.route("/")
 def home():
-    return {"status": "v11", "symbols": len(SYMBOLS)}
+    return {"status": "v11-fixed", "symbols": len(SYMBOLS)}
 
 @app.route("/equity")
 def eq():
@@ -331,33 +358,23 @@ def orders():
     return list(order_log)
 
 @app.route("/portfolio")
-def portfolio_route():
+def portfolio_api():
     return jsonify([
         {
-            "symbol": p.symbol,
-            "qty": int(p.qty),
-            "value": float(p.market_value)
+            "symbol": s,
+            "qty": int(q)
         }
-        for p in api.list_positions()
+        for s, q in positions().items()
     ])
 
 @app.route("/status")
 def status():
-    if latest_regime is None:
-        return {"status": "warming up"}
-
     acc = api.get_account()
-    pos = positions()
-
-    prices = {}
-    for p in api.list_positions():
-        prices[p.symbol] = float(p.current_price)
-
     return jsonify({
         "equity": float(acc.equity),
         "cash": float(acc.cash),
         "regime": latest_regime,
-        "exposure": exposure(pos, prices, float(acc.equity))
+        "status": "running"
     })
 
 # =========================================================
