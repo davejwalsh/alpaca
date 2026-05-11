@@ -54,21 +54,21 @@ strategy_stats = defaultdict(lambda: {"sharpe": 0, "drift": 0, "count": 0})
 # =========================================================
 # UNIVERSE
 # =========================================================
-def universe():
-    assets = api.list_assets()
+# def universe():
+#     assets = api.list_assets()
 
-    core = [
-        a.symbol for a in assets
-        if a.tradable and a.status == "active"
-        and a.exchange in ["NASDAQ", "NYSE"]
-    ]
+#     core = [
+#         a.symbol for a in assets
+#         if a.tradable and a.status == "active"
+#         and a.exchange in ["NASDAQ", "NYSE"]
+#     ]
 
-    priority = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH","HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST","PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD","ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY","QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
+#     priority = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH","HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST","PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD","ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY","QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
 
-    return sorted(core, key=lambda x: (x not in priority, x))[:SCAN_LIMIT]
+#     return sorted(core, key=lambda x: (x not in priority, x))[:SCAN_LIMIT]
 
 
-SYMBOLS = universe()
+SYMBOLS = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH","HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST","PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD","ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY","QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
 
 # =========================================================
 # DATA
