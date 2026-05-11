@@ -338,7 +338,7 @@ def home():
 def eq():
     return {"equity": list(equity_curve)}
 
-def cash_api():
+@app.route("/cash")
 def cs():
     return {"cash": list(cash_curve)}
 
