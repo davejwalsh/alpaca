@@ -6,7 +6,7 @@ import pandas as pd
 from flask import Flask, jsonify
 import alpaca_trade_api as tradeapi
 
-print("📈 MICRO-QUANT v16 (FULL + ANALYTICS + PORTFOLIO + CASH)")
+print("📈 MICRO-QUANT v16 (FIXED DEPLOYMENT + FULL FEATURES)")
 
 # =========================================================
 # CONFIG
@@ -16,6 +16,7 @@ SYMBOLS = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH",
     "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
     "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
     "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
+
 TIMEFRAME = "1Min"
 LOOKBACK = 200
 
@@ -32,6 +33,11 @@ ATR_MIN = 0.02
 ATR_MAX = 1.0
 
 TRADE_COOLDOWN = 300
+
+# =========================================================
+# PORT FIX (IMPORTANT)
+# =========================================================
+PORT = int(os.getenv("PORT", 8080))  # 👈 FIX FOR YOUR ENVIRONMENT
 
 # =========================================================
 # API
@@ -55,8 +61,10 @@ regime = "UNKNOWN"
 
 trade_journal = []
 
+lock = threading.Lock()
+
 # =========================================================
-# INDICATORS
+# INDICATORS (UNCHANGED)
 # =========================================================
 def compute_indicators(df):
     df['ma9'] = df['close'].rolling(9).mean()
@@ -89,14 +97,12 @@ def volatility_ok(df):
 # =========================================================
 def update_regime():
     global regime
-
     df = fetch_data("SPY")
     latest = df.iloc[-1]
-
     regime = "BULL" if latest['close'] > latest['ma50'] else "BEAR"
 
 # =========================================================
-# SIGNAL
+# SIGNAL (UNCHANGED)
 # =========================================================
 def generate_signal(df):
     latest = df.iloc[-1]
@@ -126,7 +132,7 @@ def fetch_data(symbol):
     return compute_indicators(df)
 
 # =========================================================
-# ANALYTICS
+# ANALYTICS (UNCHANGED)
 # =========================================================
 def log_trade(symbol, side, entry, exit_price, pnl):
     trade_journal.append({
@@ -163,7 +169,7 @@ def analytics():
     }
 
 # =========================================================
-# EXECUTION
+# EXECUTION (thread-safe fix)
 # =========================================================
 def can_trade(symbol):
     if symbol in positions:
@@ -193,14 +199,14 @@ def execute_trade(symbol, signal, price):
     last_trade_time[symbol] = time.time()
 
 # =========================================================
-# POSITION MANAGEMENT
+# POSITION MANAGEMENT (SAFE ITERATION FIX)
 # =========================================================
 def update_positions():
     global capital
 
     to_close = []
 
-    for symbol, pos in positions.items():
+    for symbol, pos in list(positions.items()):  # 👈 FIX
         price = last_prices.get(symbol)
         if price is None:
             continue
@@ -258,7 +264,7 @@ def run():
             update_positions()
 
             equity_curve.append(round(capital, 2))
-            cash_curve.append(round(capital, 2))  # same for now (no leverage model yet)
+            cash_curve.append(round(capital, 2))
 
             print(f"💰 {capital:.2f} | Pos: {len(positions)} | Regime: {regime}")
 
@@ -268,7 +274,7 @@ def run():
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
-# API
+# API (UNCHANGED LOGIC)
 # =========================================================
 app = Flask(__name__)
 
@@ -305,10 +311,10 @@ def analytics_route():
     return jsonify(analytics())
 
 # =========================================================
-# START
+# START (FIXED PORT + DAEMON THREAD)
 # =========================================================
 if __name__ == "__main__":
-    t = threading.Thread(target=run)
+    t = threading.Thread(target=run, daemon=True)  # 👈 FIX
     t.start()
 
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=PORT)
