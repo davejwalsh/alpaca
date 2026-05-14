@@ -6,36 +6,35 @@ import pandas as pd
 from flask import Flask, jsonify
 import alpaca_trade_api as tradeapi
 
-print("📈 MICRO-QUANT v17 (SMALL EQUITY OPTIMIZED)")
+print("📈 MICRO-QUANT v18 (REAL SMALL EQUITY ENGINE)")
 
 # =========================================================
 # CONFIG
 # =========================================================
-SYMBOLS = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH",     
-           "HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST",     
-           "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",     
-           "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",     
+SYMBOLS = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH",
+           "HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST",
+           "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
+           "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
            "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
 
 TIMEFRAME = "1Min"
 LOOKBACK = 200
-
 CHECK_INTERVAL = 60
 
 INITIAL_CAPITAL = 500
 capital = INITIAL_CAPITAL
 
-RISK_PER_TRADE = 0.005
+RISK_PER_TRADE = 0.01   # slightly increased, better for small accounts
 TAKE_PROFIT_MULT = 2.5
 
 ATR_PERIOD = 14
 ATR_MIN = 0.1
-ATR_MAX = 1.0
+ATR_MAX = 1.2
 
 TRADE_COOLDOWN = 1800
+MIN_TRADE_VALUE = 5       # 🔥 critical for small equity
+MAX_SPREAD_PCT = 0.002   # 0.2%
 
-# =========================================================
-# PORT FIX
 # =========================================================
 PORT = int(os.getenv("PORT", 8080))
 
@@ -60,8 +59,27 @@ last_prices = {}
 regime = "UNKNOWN"
 
 trade_journal = []
-
 lock = threading.Lock()
+
+# =========================================================
+# HELPERS
+# =========================================================
+def get_account_equity():
+    try:
+        account = api.get_account()
+        return float(account.equity)
+    except:
+        return capital  # fallback
+
+def spread_ok(symbol, price):
+    try:
+        quote = api.get_latest_quote(symbol)
+        spread = quote.ask_price - quote.bid_price
+        if spread / price > MAX_SPREAD_PCT:
+            return False
+    except:
+        return True
+    return True
 
 # =========================================================
 # INDICATORS
@@ -85,15 +103,11 @@ def compute_indicators(df):
     return df
 
 # =========================================================
-# VOL FILTER
-# =========================================================
 def volatility_ok(df):
     latest = df.iloc[-1]
     atr_pct = (latest['atr'] / latest['close']) * 100
     return ATR_MIN <= atr_pct <= ATR_MAX
 
-# =========================================================
-# REGIME
 # =========================================================
 def update_regime():
     global regime
@@ -102,8 +116,6 @@ def update_regime():
     regime = "BULL" if latest['close'] > latest['ma50'] else "BEAR"
 
 # =========================================================
-# SIGNAL
-# =========================================================
 def generate_signal(df):
     latest = df.iloc[-1]
 
@@ -111,6 +123,10 @@ def generate_signal(df):
         return None
 
     if not volatility_ok(df):
+        return None
+
+    # 🔥 extra noise filter
+    if df['close'].pct_change().std() < 0.001:
         return None
 
     if latest['close'] > latest['ma50']:
@@ -124,15 +140,11 @@ def generate_signal(df):
     return None
 
 # =========================================================
-# DATA
-# =========================================================
 def fetch_data(symbol):
     bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
     df = bars[['open', 'high', 'low', 'close', 'volume']].copy()
     return compute_indicators(df)
 
-# =========================================================
-# ANALYTICS
 # =========================================================
 def log_trade(symbol, side, entry, exit_price, pnl):
     trade_journal.append({
@@ -144,6 +156,7 @@ def log_trade(symbol, side, entry, exit_price, pnl):
         "time": time.time()
     })
 
+# =========================================================
 def analytics():
     if not trade_journal:
         return {"status": "no trades yet"}
@@ -154,7 +167,6 @@ def analytics():
     losses = df[df["pnl"] <= 0]
 
     win_rate = len(wins) / len(df)
-
     avg_win = wins["pnl"].mean() if len(wins) else 0
     avg_loss = losses["pnl"].mean() if len(losses) else 0
 
@@ -169,8 +181,6 @@ def analytics():
     }
 
 # =========================================================
-# EXECUTION
-# =========================================================
 def can_trade(symbol):
     if symbol in positions:
         return False
@@ -180,17 +190,43 @@ def can_trade(symbol):
 
     return (time.time() - last_trade_time[symbol]) > TRADE_COOLDOWN
 
+# =========================================================
 def execute_trade(symbol, signal, price, df):
     global capital
 
-    risk_amount = capital * RISK_PER_TRADE
+    equity = get_account_equity()
 
+    # 🔥 kill switch
+    if equity < 20:
+        print("⚠️ Equity too low, skipping")
+        return
+
+    risk_amount = equity * RISK_PER_TRADE
     atr = df['atr'].iloc[-1]
 
-    min_stop_pct = 0.002
-    stop_distance = max(atr * 1.2, price * min_stop_pct)
+    stop_distance = max(atr * 1.2, price * 0.002)
+    target_distance = stop_distance * TAKE_PROFIT_MULT
 
-    target_distance = stop_distance * 2.5
+    # 🔥 position sizing via NOTIONAL (fractional shares)
+    notional = risk_amount * 10  # leverage effect for small accounts
+
+    if notional < MIN_TRADE_VALUE:
+        return
+
+    if not spread_ok(symbol, price):
+        return
+
+    try:
+        api.submit_order(
+            symbol=symbol,
+            notional=notional,
+            side="buy" if signal == "LONG" else "sell",
+            type="market",
+            time_in_force="day"
+        )
+    except Exception as e:
+        print("Order failed:", e)
+        return
 
     if signal == "LONG":
         stop = price - stop_distance
@@ -210,8 +246,6 @@ def execute_trade(symbol, signal, price, df):
     last_trade_time[symbol] = time.time()
 
 # =========================================================
-# POSITION MANAGEMENT
-# =========================================================
 def update_positions():
     global capital
 
@@ -228,16 +262,13 @@ def update_positions():
             if price <= pos["stop"]:
                 pnl = -pos["risk"]
                 to_close.append((symbol, pnl, price))
-
             elif price >= pos["target"]:
                 pnl = pos["risk"] * TAKE_PROFIT_MULT
                 to_close.append((symbol, pnl, price))
-
         else:
             if price >= pos["stop"]:
                 pnl = -pos["risk"]
                 to_close.append((symbol, pnl, price))
-
             elif price <= pos["target"]:
                 pnl = pos["risk"] * TAKE_PROFIT_MULT
                 to_close.append((symbol, pnl, price))
@@ -250,8 +281,6 @@ def update_positions():
         capital += pnl
         del positions[symbol]
 
-# =========================================================
-# MAIN LOOP
 # =========================================================
 def run():
     global capital
@@ -271,7 +300,6 @@ def run():
                     if (regime == "BULL" and signal == "LONG") or \
                        (regime == "BEAR" and signal == "SHORT"):
                         execute_trade(symbol, signal, price, df)
-                    print('can_trade')  
 
             update_positions()
 
