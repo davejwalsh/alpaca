@@ -271,6 +271,7 @@ def run():
                     if (regime == "BULL" and signal == "LONG") or \
                        (regime == "BEAR" and signal == "SHORT"):
                         execute_trade(symbol, signal, price, df)
+                    print('can_trade')  
 
             update_positions()
 
