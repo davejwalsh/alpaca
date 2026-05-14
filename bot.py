@@ -6,16 +6,16 @@ import pandas as pd
 from flask import Flask, jsonify
 import alpaca_trade_api as tradeapi
 
-print("📈 MICRO-QUANT v16 (FIXED DEPLOYMENT + FULL FEATURES)")
+print("📈 MICRO-QUANT v17 (SMALL EQUITY OPTIMIZED)")
 
 # =========================================================
 # CONFIG
 # =========================================================
-SYMBOLS = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH",
-    "HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST",
-    "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
-    "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
-    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
+SYMBOLS = ["AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","UNH",     
+           "HD","PG","MA","DIS","BAC","XOM","AVGO","LLY","ADBE","COST",     
+           "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",     
+           "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",     
+           "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
 
 TIMEFRAME = "1Min"
 LOOKBACK = 200
@@ -25,19 +25,19 @@ CHECK_INTERVAL = 60
 INITIAL_CAPITAL = 500
 capital = INITIAL_CAPITAL
 
-RISK_PER_TRADE = 0.02
-TAKE_PROFIT_MULT = 1.8
+RISK_PER_TRADE = 0.005
+TAKE_PROFIT_MULT = 2.5
 
 ATR_PERIOD = 14
-ATR_MIN = 0.02
+ATR_MIN = 0.1
 ATR_MAX = 1.0
 
-TRADE_COOLDOWN = 300
+TRADE_COOLDOWN = 1800
 
 # =========================================================
-# PORT FIX (IMPORTANT)
+# PORT FIX
 # =========================================================
-PORT = int(os.getenv("PORT", 8080))  # 👈 FIX FOR YOUR ENVIRONMENT
+PORT = int(os.getenv("PORT", 8080))
 
 # =========================================================
 # API
@@ -64,7 +64,7 @@ trade_journal = []
 lock = threading.Lock()
 
 # =========================================================
-# INDICATORS (UNCHANGED)
+# INDICATORS
 # =========================================================
 def compute_indicators(df):
     df['ma9'] = df['close'].rolling(9).mean()
@@ -102,7 +102,7 @@ def update_regime():
     regime = "BULL" if latest['close'] > latest['ma50'] else "BEAR"
 
 # =========================================================
-# SIGNAL (UNCHANGED)
+# SIGNAL
 # =========================================================
 def generate_signal(df):
     latest = df.iloc[-1]
@@ -114,11 +114,11 @@ def generate_signal(df):
         return None
 
     if latest['close'] > latest['ma50']:
-        if latest['rsi'] < 40 and latest['close'] > latest['ma9']:
+        if latest['rsi'] < 35 and latest['close'] > latest['ma9']:
             return "LONG"
 
     if latest['close'] < latest['ma50']:
-        if latest['rsi'] > 60 and latest['close'] < latest['ma9']:
+        if latest['rsi'] > 65 and latest['close'] < latest['ma9']:
             return "SHORT"
 
     return None
@@ -132,7 +132,7 @@ def fetch_data(symbol):
     return compute_indicators(df)
 
 # =========================================================
-# ANALYTICS (UNCHANGED)
+# ANALYTICS
 # =========================================================
 def log_trade(symbol, side, entry, exit_price, pnl):
     trade_journal.append({
@@ -169,7 +169,7 @@ def analytics():
     }
 
 # =========================================================
-# EXECUTION (thread-safe fix)
+# EXECUTION
 # =========================================================
 def can_trade(symbol):
     if symbol in positions:
@@ -180,13 +180,24 @@ def can_trade(symbol):
 
     return (time.time() - last_trade_time[symbol]) > TRADE_COOLDOWN
 
-def execute_trade(symbol, signal, price):
+def execute_trade(symbol, signal, price, df):
     global capital
 
     risk_amount = capital * RISK_PER_TRADE
 
-    stop = price * (0.997 if signal == "LONG" else 1.003)
-    target = price * (1.005 if signal == "LONG" else 0.995)
+    atr = df['atr'].iloc[-1]
+
+    min_stop_pct = 0.002
+    stop_distance = max(atr * 1.2, price * min_stop_pct)
+
+    target_distance = stop_distance * 2.5
+
+    if signal == "LONG":
+        stop = price - stop_distance
+        target = price + target_distance
+    else:
+        stop = price + stop_distance
+        target = price - target_distance
 
     positions[symbol] = {
         "side": signal,
@@ -199,14 +210,14 @@ def execute_trade(symbol, signal, price):
     last_trade_time[symbol] = time.time()
 
 # =========================================================
-# POSITION MANAGEMENT (SAFE ITERATION FIX)
+# POSITION MANAGEMENT
 # =========================================================
 def update_positions():
     global capital
 
     to_close = []
 
-    for symbol, pos in list(positions.items()):  # 👈 FIX
+    for symbol, pos in list(positions.items()):
         price = last_prices.get(symbol)
         if price is None:
             continue
@@ -259,7 +270,7 @@ def run():
                 if signal and can_trade(symbol):
                     if (regime == "BULL" and signal == "LONG") or \
                        (regime == "BEAR" and signal == "SHORT"):
-                        execute_trade(symbol, signal, price)
+                        execute_trade(symbol, signal, price, df)
 
             update_positions()
 
@@ -274,7 +285,7 @@ def run():
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
-# API (UNCHANGED LOGIC)
+# API
 # =========================================================
 app = Flask(__name__)
 
@@ -311,10 +322,10 @@ def analytics_route():
     return jsonify(analytics())
 
 # =========================================================
-# START (FIXED PORT + DAEMON THREAD)
+# START
 # =========================================================
 if __name__ == "__main__":
-    t = threading.Thread(target=run, daemon=True)  # 👈 FIX
+    t = threading.Thread(target=run, daemon=True)
     t.start()
 
     app.run(host="0.0.0.0", port=PORT)
