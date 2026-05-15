@@ -6,279 +6,284 @@ import pandas as pd
 from flask import Flask, jsonify
 import alpaca_trade_api as tradeapi
 
-print("📈 MICRO-QUANT v29 (REALISTIC RISK + STABLE LEARNING CORE)")
+# ================= CONFIG =================
 
-# =========================================================
-SYMBOLS = ["AAPL","MSFT","NVDA","TSLA","AMD","META","AMZN","GOOGL"]
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = "https://paper-api.alpaca.markets"
+
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "SPY"]
 
 TIMEFRAME = "1Min"
 LOOKBACK = 200
-CHECK_INTERVAL = 20
 
-INITIAL_CAPITAL = 500
-capital = INITIAL_CAPITAL
+RISK_PER_TRADE = 0.01
+STOP_LOSS_PCT = 0.005
+TAKE_PROFIT_PCT = 0.01
 
-RISK_PER_TRADE = 0.01          # 1% risk per trade (realistic micro-account)
-MAX_POSITIONS = 5
+MIN_MOVE = 0.0015
+MAX_SPREAD = 0.002
+COOLDOWN_SECONDS = 300
+DAILY_LOSS_LIMIT = -0.03
 
-ATR_PERIOD = 14
-ATR_MULT_STOP = 1.5
-ATR_MULT_TARGET = 3.0
+# ==========================================
 
-PORT = int(os.getenv("PORT", 8080))
+app = Flask(__name__)
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
 
-api = tradeapi.REST(
-    os.getenv("APCA_API_KEY_ID"),
-    os.getenv("APCA_API_SECRET_KEY"),
-    base_url="https://paper-api.alpaca.markets"
-)
-
-# =========================================================
 positions = {}
-trade_journal = []
-equity_curve = []
+last_trade_time = {}
+daily_start_equity = None
 
-# =========================================================
-# WEIGHTS (regime-aware learning system preserved)
-# =========================================================
-weights = {
-    "TREND": {"trend": 1.0, "compression": 1.0, "volume": 1.0, "breakout": 1.0, "volatility": 1.0},
-    "CHOP":  {"trend": 1.0, "compression": 1.0, "volume": 1.0, "breakout": 1.0, "volatility": 1.0},
-    "VOL":   {"trend": 1.0, "compression": 1.0, "volume": 1.0, "breakout": 1.0, "volatility": 1.0}
-}
+# ============== HELPERS ===================
 
-stats = {"TREND": {"n": 0}, "CHOP": {"n": 0}, "VOL": {"n": 0}}
+def get_account():
+    return api.get_account()
 
-# =========================================================
+def get_equity():
+    return float(get_account().equity)
+
+def get_daily_pnl():
+    global daily_start_equity
+    equity = get_equity()
+    if daily_start_equity is None:
+        daily_start_equity = equity
+        return 0
+    return (equity - daily_start_equity) / daily_start_equity
+
+def get_data(symbol):
+    bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
+
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+
+    if 'symbol' in bars.columns:
+        return bars[bars['symbol'] == symbol].copy()
+
+    return bars.copy()
+
 def compute_indicators(df):
-    df["ma9"] = df["close"].rolling(9).mean()
-    df["ma50"] = df["close"].rolling(50).mean()
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-
-    rs = gain / (loss + 1e-9)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    tr = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift()),
-            abs(df["low"] - df["close"].shift())
-        )
-    )
-
-    df["atr"] = pd.Series(tr).rolling(ATR_PERIOD).mean()
-    df["vol_mean"] = df["volume"].rolling(20).mean()
-
+    df['rsi'] = compute_rsi(df['close'])
+    df['ma_fast'] = df['close'].rolling(10).mean()
+    df['ma_slow'] = df['close'].rolling(50).mean()
+    df['volatility'] = df['close'].pct_change().rolling(20).std()
+    df['volume_avg'] = df['volume'].rolling(20).mean()
     return df
 
-# =========================================================
-def fetch(symbol):
-    bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
-    return compute_indicators(bars)
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# =========================================================
-def classify_regime(df):
-    close = df["close"].iloc[-1]
-    atr = df["atr"].iloc[-1]
+# ============== SIGNAL ENGINE ===================
 
-    vol = (atr / (close + 1e-9)) * 100
+def generate_signal(symbol, df):
 
-    # smoothed regime (prevents flicker)
-    prev_close = df["close"].iloc[-2] if len(df) > 2 else close
-    prev_atr = df["atr"].iloc[-2] if len(df) > 2 else atr
-    prev_vol = (prev_atr / (prev_close + 1e-9)) * 100
 
-    if vol > 2.0 and prev_vol > 2.0:
-        return "VOL"
 
-    return "TREND" if close > df["ma50"].iloc[-1] else "CHOP"
+    if len(df) < 60:
+        return None
 
-# =========================================================
-def features(df):
-    close = df["close"].iloc[-1]
+    df = compute_indicators(df)
+    latest = df.iloc[-1]
 
-    vol_mean = df["vol_mean"].iloc[-1]
-    vol_now = df["volume"].iloc[-1]
+    price = latest['close']
 
-    return {
-        "trend": 1 if close > df["ma50"].iloc[-1] else 0,
-        "compression": 1 if df["close"].pct_change().rolling(25).std().iloc[-1] < 0.007 else 0,
-        "volume": 1 if (not np.isnan(vol_mean) and vol_now > vol_mean * 1.2) else 0,
-        "breakout": 1 if close > df["ma9"].iloc[-1] else 0,
-        "volatility": 1 if 0.02 <= (df["atr"].iloc[-1] / (close + 1e-9)) * 100 <= 2 else 0
-    }
+    spread = abs(df['high'].iloc[-1] - df['low'].iloc[-1]) / price
+    if spread > MAX_SPREAD:
+        return None
 
-# =========================================================
-def score(f, regime):
-    return sum(f[k] * weights[regime][k] for k in f)
+    # ---------- MIN MOVE FILTER ----------
+    recent_move = abs(df['close'].pct_change().iloc[-1])
+    if recent_move < MIN_MOVE:
+        return None
 
-# =========================================================
-def generate_signal(df):
-    reg = classify_regime(df)
-    f = features(df)
+    # ---------- VOLUME FILTER ----------
+    if latest['volume'] < latest['volume_avg']:
+        return None
 
-    if any(pd.isna(v) for v in f.values()):
-        return None, None, reg
+    # ---------- TREND ----------
+    trend_up = latest['ma_fast'] > latest['ma_slow']
+    trend_down = latest['ma_fast'] < latest['ma_slow']
 
-    s = score(f, reg)
+    # ---------- RSI ----------
+    rsi = latest['rsi']
 
-    n = stats[reg]["n"]
-    threshold = 2.6 if n < 20 else 2.85
+    # ---------- COMPRESSION ----------
+    volatility = df['volatility'].iloc[-1]
+    compression = volatility < 0.01
 
-    if s < threshold:
-        return None, None, reg
+    # ---------- DROP DETECTION ----------
+    lookback_drop = (df['close'].iloc[-20] - price) / df['close'].iloc[-20]
 
-    if f["trend"] and f["breakout"]:
-        return "LONG", f, reg
+    # ---------- BREAKOUT ----------
+    breakout_up = (
+        compression and
+        lookback_drop > 0.02 and
+        price > df['close'].rolling(10).mean().iloc[-1] and
+        df['close'].iloc[-1] > df['close'].iloc[-2]
+    )
 
-    if not f["trend"] and f["breakout"]:
-        return "SHORT", f, reg
+    breakout_down = (
+        compression and
+        lookback_drop < -0.02 and
+        price < df['close'].rolling(10).mean().iloc[-1]
+    )
 
-    return None, f, reg
+    # ---------- SIGNAL LOGIC ----------
+    signal = None
 
-# =========================================================
-def position_size(price, atr):
-    risk_dollars = capital * RISK_PER_TRADE
-    stop_distance = atr * ATR_MULT_STOP
+    if breakout_up:
+        signal = "BUY"
 
-    qty = risk_dollars / (stop_distance + 1e-9)
-    return max(qty, 0)
+    elif breakout_down:
+        signal = "SELL"
 
-# =========================================================
-def execute(symbol, side, df, f, reg):
-    global capital
+    elif trend_up and rsi < 40:
+        signal = "BUY"
 
-    price = df["close"].iloc[-1]
-    atr = df["atr"].iloc[-1]
+    elif trend_down and rsi > 60:
+        signal = "SELL"
 
-    qty = position_size(price, atr)
+    # ---------- DEBUG ----------
+    print(f"""
+    SYMBOL: {symbol}
+    PRICE: {price}
+    SIGNAL: {signal}
+    RSI: {rsi}
+    VOL: {volatility}
+    DROP: {lookback_drop}
+    """)
+
+    return signal
+
+# ============== EXECUTION ===================
+
+def place_trade(symbol, signal, price):
+
+    open_positions = [p.symbol for p in api.list_positions()]
+
+    if symbol in open_positions:
+        return
+    
+    # ---------- DAILY LOSS LIMIT ----------
+    if get_daily_pnl() < DAILY_LOSS_LIMIT:
+        print("Daily loss limit hit. Stopping trading.")
+        return
+
+    # ---------- COOLDOWN ----------
+    now = time.time()
+    if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN_SECONDS:
+        return
+
+    # ---------- POSITION SIZING ----------
+    equity = get_equity()
+    risk = equity * RISK_PER_TRADE
+    stop_distance = price * STOP_LOSS_PCT
+    qty = int(risk / stop_distance)
 
     if qty <= 0:
         return
 
-    stop = price - atr * ATR_MULT_STOP if side == "LONG" else price + atr * ATR_MULT_STOP
-    target = price + atr * ATR_MULT_TARGET if side == "LONG" else price - atr * ATR_MULT_TARGET
+    try:
+        if signal == "BUY":
+            api.submit_order(symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc')
+        elif signal == "SELL":
+            api.submit_order(symbol=symbol, qty=qty, side='sell', type='market', time_in_force='gtc')
 
-    positions[symbol] = {
-        "side": side,
-        "entry": price,
-        "qty": qty,
-        "stop": stop,
-        "target": target,
-        "atr_entry": atr,
-        "regime": reg,
-        "features": f
-    }
+        last_trade_time[symbol] = now
 
-    print(f"📌 ENTRY {symbol} {side} qty={qty:.2f} @ {price:.2f}")
+        print(f"TRADE: {signal} {symbol} QTY: {qty}")
 
-# =========================================================
-def update_weights(regime, f, pnl, atr_entry):
-    stats[regime]["n"] += 1
-    n = stats[regime]["n"]
+    except Exception as e:
+        print(f"Order failed: {e}")
 
-    confidence = min(1.0, n / 50)
+# ============== MAIN LOOP ===================
 
-    reward = pnl / (atr_entry + 1e-9)
-    reward = np.tanh(reward)
-
-    for k in weights[regime]:
-        weights[regime][k] += 0.015 * confidence * reward * (f[k] - 0.5)
-        weights[regime][k] = float(np.clip(weights[regime][k], 0.3, 2.0))
-
-# =========================================================
-def update_positions():
-    global capital
-
-    for symbol, pos in list(positions.items()):
-        df = fetch(symbol)
-        price = df["close"].iloc[-1]
-
-        pnl_per_share = (price - pos["entry"]) if pos["side"] == "LONG" else (pos["entry"] - price)
-        pnl = pnl_per_share * pos["qty"]
-
-        # trailing stop + target
-        if pos["side"] == "LONG":
-            exit_cond = price <= pos["stop"] or price >= pos["target"]
-        else:
-            exit_cond = price >= pos["stop"] or price <= pos["target"]
-
-        if not exit_cond:
-            continue
-
-        capital += pnl
-
-        update_weights(pos["regime"], pos["features"], pnl, pos["atr_entry"])
-
-        trade_journal.append({
-            "symbol": symbol,
-            "pnl": pnl,
-            "regime": pos["regime"],
-            "time": time.time()
-        })
-
-        print(f"📤 EXIT {symbol} pnl={pnl:.2f}")
-
-        del positions[symbol]
-
-# =========================================================
-def run():
+def trading_loop():
     while True:
         try:
             for symbol in SYMBOLS:
-                df = fetch(symbol)
+                df = get_data(symbol)
+                
+                if df is None or df.empty or len(df) < 60:
+                    continue
+                signal = generate_signal(symbol, df)
 
-                sig, f, reg = generate_signal(df)
-
-                if sig and symbol not in positions and len(positions) < MAX_POSITIONS:
-                    execute(symbol, sig, df, f, reg)
-
-            update_positions()
-
-            equity_curve.append(capital)
-
-            print(f"💰 {capital:.2f} | POS {len(positions)}")
+                if signal:
+                    price = df['close'].iloc[-1]
+                    place_trade(symbol, signal, price)
 
         except Exception as e:
-            print("ERROR:", e)
+            print(f"Loop error: {e}")
 
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(10)
 
-# =========================================================
-app = Flask(__name__)
+# ============== API ===================
 
-@app.route("/status")
-def status():
-    return jsonify({
-        "capital": capital,
-        "positions": len(positions),
-        "weights": weights,
-        "stats": stats
-    })
+@app.route("/")
+def home():
+    return jsonify({"status": "running"})
+
+@app.route("/pnl")
+def pnl():
+    return jsonify({"daily_pnl": get_daily_pnl()})
+
+@app.route("/account")
+def account():
+    try:
+        acc = api.get_account()
+
+        return jsonify({
+            "equity": float(acc.equity),
+            "cash": float(acc.cash),
+            "buying_power": float(acc.buying_power),
+            "portfolio_value": float(acc.portfolio_value),
+            "status": acc.status
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route("/equity")
 def equity():
-    return jsonify(equity_curve)
+    try:
+        current_equity = get_equity()
 
-@app.route("/positions")
-def get_positions():
-    return jsonify(positions)
+        return jsonify({
+            "current_equity": current_equity,
+            "start_equity": daily_start_equity,
+            "daily_pnl_pct": get_daily_pnl()
+        })
 
-@app.route("/analytics")
-def analytics():
-    if not trade_journal:
-        return {"status": "no trades"}
-    df = pd.DataFrame(trade_journal)
-    return {
-        "trades": len(df),
-        "win_rate": float((df["pnl"] > 0).mean()),
-        "avg_pnl": float(df["pnl"].mean())
-    }
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
-# =========================================================
+@app.route("/portfolio")
+def portfolio():
+    try:
+        positions = api.list_positions()
+
+        data = []
+        for p in positions:
+            data.append({
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "side": p.side,
+                "market_value": float(p.market_value),
+                "avg_entry_price": float(p.avg_entry_price),
+                "unrealized_pl": float(p.unrealized_pl),
+                "unrealized_plpc": float(p.unrealized_plpc)
+            })
+
+        return jsonify(data)
+
+    except Exception as e:
+        return jsonify({"error": str(e)})
+# ============== START ===================
+
 if __name__ == "__main__":
-    threading.Thread(target=run, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    threading.Thread(target=trading_loop).start()
+    app.run(host="0.0.0.0", port=5000)
