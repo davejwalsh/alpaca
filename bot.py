@@ -12,24 +12,24 @@ API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets"
 
-SYMBOLS = [
+SYMBOLS = list(set([
     "AAPL","TSLA","NVDA","AMD","SPY",
     "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
-    "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
+    "ACN","DHR","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
     "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK",
-    "F", "SOFI", "INTC", "PBR", "T", "CMCSA", "DKNG", "HPQ", 
-     "NOK","BAC","WFC","C","CSX","KMI","VZ","UAL","DAL","CCL",
+    "F","SOFI","PBR","T","CMCSA","DKNG","HPQ",
+    "NOK","BAC","WFC","C","CSX","KMI","VZ","UAL","DAL","CCL",
     "RIVN","LCID","PLTR","OPEN","CHWY","SNAP",
     "ROKU","COIN","AFRM","UPST","SHOP","SQ","PYPL",
     "RIOT","MARA","RUN","ENPH",
     "XOM","OXY","SLB","HAL","EOG",
     "ADBE","NOW","CRWD","ZS","OKTA","NET","DDOG",
-    "JPM","SCHW","AXP","PYPL",
+    "JPM","SCHW","AXP",
     "NKE","SBUX","TGT","COST","HD",
-    "GM","RIVN","LCID",
+    "GM",
     "PFE","JNJ","LLY","GILD","BIIB",
     "UBER","LYFT","ABNB","ETSY","EBAY"
-]
+]))
 
 TIMEFRAME = "1Min"
 LOOKBACK = 200
@@ -71,7 +71,7 @@ def account_updater():
         except Exception as e:
             print("Account update error:", e)
 
-        time.sleep(10)
+        time.sleep(15)
 
 # ================= HELPERS =================
 
@@ -93,7 +93,10 @@ def get_daily_pnl():
 
 def calculate_position_size(price):
     try:
-        account = api.get_account()
+        account = get_account()
+        if not account:
+            return 0
+        
         cash = float(account.cash)
 
         # Risk per trade (e.g. 10% of cash)
@@ -114,20 +117,24 @@ def calculate_position_size(price):
 
 # ================= DATA =================
 
-def get_data(symbol):
+def get_all_data():
     try:
-        bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
-        if bars is None or bars.empty:
-            return pd.DataFrame()
-
-        if "symbol" in bars.columns:
-            bars = bars[bars["symbol"] == symbol]
-
-        return bars
-
+        bars = api.get_bars(SYMBOLS, TIMEFRAME, limit=LOOKBACK).df
     except Exception as e:
-        print("Data error:", symbol, e)
-        return pd.DataFrame()
+        print("Batch data error:", e)
+        return {}
+
+    if bars is None or bars.empty:
+        return {}
+
+    data = {}
+
+    for symbol in SYMBOLS:
+        df = bars[bars["symbol"] == symbol]
+        if not df.empty:
+            data[symbol] = df
+
+    return data
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -272,38 +279,36 @@ def place_trade(symbol, signal, price):
     # ================= SELL =================
     elif signal == "SELL":
 
-        if not position:
-            # 🚫 No shorting allowed → skip
-            return
+    if not position:
+        return
 
-        qty = calculate_position_size(price)
+    qty = int(float(position.qty))
 
-        if qty <= 0:
-            print(f"Not enough funds to buy this quantity")
-            return
+    if qty <= 0:
+        return
 
-        try:
-            print(f"EXECUTING SELL (close): {symbol} qty={qty} price={price}")
+    try:
+        print(f"EXECUTING SELL (close): {symbol} qty={qty} price={price}")
 
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side="sell",
-                type="market",
-                time_in_force="gtc"
-            )
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell",
+            type="market",
+            time_in_force="gtc"
+        )
 
-            last_trade_time[symbol] = now
+        last_trade_time[symbol] = now
 
-        except Exception as e:
-            print("SELL error:", e)
+    except Exception as e:
+        print("SELL error:", e)
 # ================= LOOP =================
 
 def trading_loop():
     while True:
         try:
-            for symbol in SYMBOLS:
-                df = get_data(symbol)
+            data_map = get_all_data()
+            for symbol, df in data_map.items():
                 if df.empty:
                     continue
 
@@ -315,7 +320,7 @@ def trading_loop():
         except Exception as e:
             print("Loop error:", e)
 
-        time.sleep(10)
+        time.sleep(15)
 
 # ================= ENDPOINTS =================
 
