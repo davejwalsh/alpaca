@@ -133,7 +133,7 @@ def get_all_data():
         df = bars[bars["symbol"] == symbol]
         if not df.empty:
             data[symbol] = df
-
+    print(f"Fetched data for {len(data)} symbols", flush=True)
     return data
 
 def compute_rsi(series, period=14):
@@ -200,7 +200,7 @@ def generate_signal(symbol, df):
 
         breakout_up = compression and lookback_drop > 0.02
         breakout_down = compression and lookback_drop < -0.02
-
+       
         if breakout_up:
             return "BUY"
         if breakout_down:
@@ -316,6 +316,8 @@ def trading_loop():
 
                 if signal:
                     place_trade(symbol, signal, df["close"].iloc[-1])
+                else:
+                    log_decision(symbol, price, None, f"No signal (RSI={rsi:.2f})")
 
         except Exception as e:
             print("Loop error:", e)
