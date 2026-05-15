@@ -213,52 +213,90 @@ def generate_signal(symbol, df):
 def place_trade(symbol, signal, price):
 
     try:
-        open_positions = [p.symbol for p in api.list_positions()]
-    except:
-        open_positions = []
+        open_positions = {p.symbol: p for p in api.list_positions()}
+    except Exception as e:
+        print("Position fetch error:", e)
+        open_positions = {}
 
-    if symbol in open_positions:
-        return
+    position = open_positions.get(symbol)
 
+    # 🚫 DAILY LOSS LIMIT
     if get_daily_pnl() < DAILY_LOSS_LIMIT:
+        print("Daily loss limit hit.")
         return
 
+    # ⏱ COOLDOWN
     now = time.time()
     if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN_SECONDS:
         return
 
     equity = get_equity()
-    if not equity:
+    if equity is None:
+        print("No equity yet.")
         return
 
-    risk = equity * RISK_PER_TRADE
-    stop_distance = price * STOP_LOSS_PCT
+    # ================= BUY =================
+    if signal == "BUY":
 
-    if stop_distance <= 0:
-        return
+        if position:
+            # Already holding → skip
+            return
 
-    qty = calculate_position_size(price)
+        risk = equity * RISK_PER_TRADE
+        stop_distance = price * STOP_LOSS_PCT
 
-    if qty <= 0:
-        print(f"Skipping {symbol} — not enough cash")
-        return
+        if stop_distance <= 0:
+            return
 
-    try:
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="buy" if signal == "BUY" else "sell",
-            type="market",
-            time_in_force="gtc"
-        )
+        qty = int(risk / stop_distance)
 
-        last_trade_time[symbol] = now
-        print("TRADE:", signal, symbol, qty)
+        if qty <= 0:
+            return
 
-    except Exception as e:
-        print("Order error:", e)
-    print(f"EXECUTING TRADE: {signal} {symbol} qty={qty} price={price}", flush=True)
+        try:
+            print(f"EXECUTING BUY: {symbol} qty={qty} price={price}")
 
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="buy",
+                type="market",
+                time_in_force="gtc"
+            )
+
+            last_trade_time[symbol] = now
+
+        except Exception as e:
+            print("BUY error:", e)
+
+    # ================= SELL =================
+    elif signal == "SELL":
+
+        if not position:
+            # 🚫 No shorting allowed → skip
+            return
+
+        qty = calculate_position_size(price)
+
+        if qty <= 0:
+            print(f"Not enough funds to buy this quantity")
+            return
+
+        try:
+            print(f"EXECUTING SELL (close): {symbol} qty={qty} price={price}")
+
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="sell",
+                type="market",
+                time_in_force="gtc"
+            )
+
+            last_trade_time[symbol] = now
+
+        except Exception as e:
+            print("SELL error:", e)
 # ================= LOOP =================
 
 def trading_loop():
