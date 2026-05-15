@@ -279,29 +279,29 @@ def place_trade(symbol, signal, price):
     # ================= SELL =================
     elif signal == "SELL":
 
-    if not position:
-        return
-
-    qty = int(float(position.qty))
-
-    if qty <= 0:
-        return
-
-    try:
-        print(f"EXECUTING SELL (close): {symbol} qty={qty} price={price}")
-
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="sell",
-            type="market",
-            time_in_force="gtc"
-        )
-
-        last_trade_time[symbol] = now
-
-    except Exception as e:
-        print("SELL error:", e)
+        if not position:
+            return
+    
+        qty = int(float(position.qty))
+    
+        if qty <= 0:
+            return
+    
+        try:
+            print(f"EXECUTING SELL (close): {symbol} qty={qty} price={price}")
+    
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="sell",
+                type="market",
+                time_in_force="gtc"
+            )
+    
+            last_trade_time[symbol] = now
+    
+        except Exception as e:
+            print("SELL error:", e)
 # ================= LOOP =================
 
 def trading_loop():
