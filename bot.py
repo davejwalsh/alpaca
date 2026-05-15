@@ -317,7 +317,7 @@ def trading_loop():
                 if signal:
                     place_trade(symbol, signal, df["close"].iloc[-1])
                 else:
-                    log_decision(symbol, price, None, f"No signal (RSI={rsi:.2f})")
+                    print("No signal")
 
         except Exception as e:
             print("Loop error:", e)
