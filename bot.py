@@ -12,8 +12,8 @@ API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets"
 
-SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "SPY",   
-           "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",     
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "SPY",
+          "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",     
            "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",     
            "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
 
@@ -36,42 +36,53 @@ api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
 
 positions = {}
 last_trade_time = {}
+
+# 🔥 CACHED STATE (THIS FIXES EVERYTHING)
+cached_equity = None
+cached_account = None
 daily_start_equity = None
-account_cache = {"equity": None, "ts": 0}
+lock = threading.Lock()
 
-# ============== SAFE API WRAPPER ===================
+# ============== ACCOUNT CACHE THREAD ===================
 
-def safe_get_account():
-    try:
-        return api.get_account()
-    except Exception as e:
-        print("Account fetch error:", e)
-        return None
+def account_updater():
+    global cached_equity, cached_account, daily_start_equity
+
+    while True:
+        try:
+            acc = api.get_account()
+
+            with lock:
+                cached_account = acc
+                cached_equity = float(acc.equity)
+
+                if daily_start_equity is None:
+                    daily_start_equity = cached_equity
+
+        except Exception as e:
+            print("Account update error:", e)
+
+        time.sleep(5)   # IMPORTANT: avoids rate limits
+
+# ============== HELPERS ===================
 
 def get_equity():
-    acc = safe_get_account()
-    if not acc:
-        return None
-    try:
-        return float(acc.equity)
-    except:
-        return None
+    with lock:
+        return cached_equity
+
+def get_account():
+    with lock:
+        return cached_account
 
 def get_daily_pnl():
-    global daily_start_equity
-
-    equity = get_equity()
-    if equity is None:
-        return 0.0
-
-    if daily_start_equity is None:
-        daily_start_equity = equity
+    eq = get_equity()
+    if eq is None or daily_start_equity is None:
         return 0.0
 
     if daily_start_equity == 0:
         return 0.0
 
-    return (equity - daily_start_equity) / daily_start_equity
+    return (eq - daily_start_equity) / daily_start_equity
 
 # ============== DATA ===================
 
@@ -99,13 +110,11 @@ def compute_rsi(series, period=14):
 
 def compute_indicators(df):
     df = df.copy()
-
-    df['rsi'] = compute_rsi(df['close'])
-    df['ma_fast'] = df['close'].rolling(10).mean()
-    df['ma_slow'] = df['close'].rolling(50).mean()
-    df['volatility'] = df['close'].pct_change().rolling(20).std()
-    df['volume_avg'] = df['volume'].rolling(20).mean()
-
+    df["rsi"] = compute_rsi(df["close"])
+    df["ma_fast"] = df["close"].rolling(10).mean()
+    df["ma_slow"] = df["close"].rolling(50).mean()
+    df["volatility"] = df["close"].pct_change().rolling(20).std()
+    df["volume_avg"] = df["volume"].rolling(20).mean()
     return df
 
 # ============== SIGNAL ENGINE ===================
@@ -118,22 +127,16 @@ def generate_signal(symbol, df):
     df = compute_indicators(df)
     latest = df.iloc[-1]
 
-    if pd.isna(latest["close"]):
-        return None
-
     price = latest["close"]
 
-    # spread filter
     spread = abs(df["high"].iloc[-1] - df["low"].iloc[-1]) / (price + 1e-9)
     if spread > MAX_SPREAD:
         return None
 
-    # min move
     recent_move = abs(df["close"].pct_change().iloc[-1])
     if pd.isna(recent_move) or recent_move < MIN_MOVE:
         return None
 
-    # volume filter
     if latest["volume"] < latest["volume_avg"]:
         return None
 
@@ -171,19 +174,16 @@ def generate_signal(symbol, df):
     elif trend_down and rsi > 60:
         signal = "SELL"
 
-    print(f"[DEBUG] {symbol} price={price:.2f} signal={signal} rsi={rsi:.2f}")
-
     return signal
 
 # ============== EXECUTION ===================
 
 def place_trade(symbol, signal, price):
 
-    open_positions = []
     try:
         open_positions = [p.symbol for p in api.list_positions()]
     except:
-        pass
+        open_positions = []
 
     if symbol in open_positions:
         return
@@ -221,7 +221,6 @@ def place_trade(symbol, signal, price):
         )
 
         last_trade_time[symbol] = now
-        print(f"TRADE: {signal} {symbol} qty={qty}")
 
     except Exception as e:
         print("Order error:", e)
@@ -260,7 +259,7 @@ def pnl():
 
 @app.route("/account")
 def account():
-    acc = safe_get_account()
+    acc = get_account()
     if not acc:
         return jsonify({"error": "account unavailable"}), 503
 
@@ -274,12 +273,12 @@ def account():
 
 @app.route("/equity")
 def equity():
-    equity = get_equity()
-    if equity is None:
+    eq = get_equity()
+    if eq is None:
         return jsonify({"error": "equity unavailable"}), 503
 
     return jsonify({
-        "current_equity": equity,
+        "current_equity": eq,
         "start_equity": daily_start_equity,
         "daily_pnl_pct": get_daily_pnl()
     })
@@ -288,26 +287,23 @@ def equity():
 def portfolio():
     try:
         positions = api.list_positions()
-        data = []
-
-        for p in positions:
-            data.append({
+        return jsonify([
+            {
                 "symbol": p.symbol,
                 "qty": float(p.qty),
                 "side": p.side,
                 "market_value": float(p.market_value),
-                "avg_entry_price": float(p.avg_entry_price),
-                "unrealized_pl": float(p.unrealized_pl),
-                "unrealized_plpc": float(p.unrealized_plpc)
-            })
-
-        return jsonify(data)
-
+                "avg_entry": float(p.avg_entry_price),
+                "pnl": float(p.unrealized_pl)
+            }
+            for p in positions
+        ])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ============== START ===================
 
 if __name__ == "__main__":
+    threading.Thread(target=account_updater, daemon=True).start()
     threading.Thread(target=trading_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
