@@ -16,7 +16,19 @@ SYMBOLS = [
     "AAPL","TSLA","NVDA","AMD","SPY",
     "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
     "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
-    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"
+    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK",
+    "F", "SOFI", "INTC", "PBR", "T", "CMCSA", "DKNG", "HPQ", 
+     "NOK","BAC","WFC","C","CSX","KMI","VZ","UAL","DAL","CCL",
+    "RIVN","LCID","PLTR","OPEN","CHWY","SNAP",
+    "ROKU","COIN","AFRM","UPST","SHOP","SQ","PYPL",
+    "RIOT","MARA","RUN","ENPH",
+    "XOM","OXY","SLB","HAL","EOG",
+    "ADBE","NOW","CRWD","ZS","OKTA","NET","DDOG",
+    "JPM","SCHW","AXP","PYPL",
+    "NKE","SBUX","TGT","COST","HD",
+    "GM","RIVN","LCID",
+    "PFE","JNJ","LLY","GILD","BIIB",
+    "UBER","LYFT","ABNB","ETSY","EBAY"
 ]
 
 TIMEFRAME = "1Min"
@@ -78,6 +90,27 @@ def get_daily_pnl():
     if daily_start_equity == 0:
         return 0.0
     return (eq - daily_start_equity) / daily_start_equity
+
+def calculate_position_size(price):
+    try:
+        account = api.get_account()
+        cash = float(account.cash)
+
+        # Risk per trade (e.g. 10% of cash)
+        risk_fraction = 0.1
+
+        max_trade_value = cash * risk_fraction
+
+        qty = int(max_trade_value // price)
+
+        if qty < 1:
+            return 0
+
+        return qty
+
+    except Exception as e:
+        print(f"Position size error: {e}")
+        return 0
 
 # ================= DATA =================
 
@@ -204,8 +237,10 @@ def place_trade(symbol, signal, price):
     if stop_distance <= 0:
         return
 
-    qty = int(risk / stop_distance)
+    qty = calculate_position_size(price)
+
     if qty <= 0:
+        print(f"Skipping {symbol} — not enough cash")
         return
 
     try:
