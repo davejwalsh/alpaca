@@ -12,11 +12,12 @@ API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets"
 
-SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "SPY",
-          "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",     
-           "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",     
-           "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
-
+SYMBOLS = [
+    "AAPL", "TSLA", "NVDA", "AMD", "SPY",
+    "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
+    "ACN","DHR","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
+    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"
+]
 
 TIMEFRAME = "1Min"
 LOOKBACK = 200
@@ -30,7 +31,7 @@ MAX_SPREAD = 0.002
 COOLDOWN_SECONDS = 300
 DAILY_LOSS_LIMIT = -0.03
 
-# ==========================================
+# ================= APP =================
 
 app = Flask(__name__)
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
@@ -38,34 +39,48 @@ api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
 positions = {}
 last_trade_time = {}
 
-# 🔥 CACHED STATE (THIS FIXES EVERYTHING)
-cached_equity = None
-cached_account = None
-daily_start_equity = None
-lock = threading.Lock()
+# ================= SAFE SHARED STATE =================
 
-# ============== ACCOUNT CACHE THREAD ===================
+lock = threading.Lock()
+cached_account = None
+cached_equity = None
+daily_start_equity = None
+
+# ================= SAFE ALPACA WRAPPER =================
+
+def safe_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print("Alpaca error:", e)
+        return None
+
+# ================= ACCOUNT THREAD =================
 
 def account_updater():
-    global cached_equity, cached_account, daily_start_equity
+    global cached_account, cached_equity, daily_start_equity
 
     while True:
         try:
-            acc = api.get_account()
+            acc = safe_call(api.get_account)
+            if not acc:
+                time.sleep(5)
+                continue
+
+            eq = float(acc.equity)
 
             with lock:
                 cached_account = acc
-                cached_equity = float(acc.equity)
-
+                cached_equity = eq
                 if daily_start_equity is None:
-                    daily_start_equity = cached_equity
+                    daily_start_equity = eq
 
         except Exception as e:
-            print("Account update error:", e)
+            print("Account thread error:", e)
 
-        time.sleep(5)   # IMPORTANT: avoids rate limits
+        time.sleep(5)
 
-# ============== HELPERS ===================
+# ================= HELPERS =================
 
 def get_equity():
     with lock:
@@ -76,31 +91,32 @@ def get_account():
         return cached_account
 
 def get_daily_pnl():
-    eq = get_equity()
-    if eq is None or daily_start_equity is None:
+    with lock:
+        eq = cached_equity
+        start = daily_start_equity
+
+    if eq is None or start is None or start == 0:
         return 0.0
 
-    if daily_start_equity == 0:
-        return 0.0
+    return (eq - start) / start
 
-    return (eq - daily_start_equity) / daily_start_equity
-
-# ============== DATA ===================
+# ================= DATA =================
 
 def get_data(symbol):
-    try:
-        bars = api.get_bars(symbol, TIMEFRAME, limit=LOOKBACK).df
-    except Exception as e:
-        print("Data error:", symbol, e)
+    bars = safe_call(api.get_bars, symbol, TIMEFRAME, limit=LOOKBACK)
+
+    if bars is None:
         return pd.DataFrame()
 
-    if bars is None or bars.empty:
+    df = bars.df if hasattr(bars, "df") else pd.DataFrame(bars)
+
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    if "symbol" in bars.columns:
-        bars = bars[bars["symbol"] == symbol]
+    if "symbol" in df.columns:
+        df = df[df["symbol"] == symbol]
 
-    return bars
+    return df
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -111,14 +127,16 @@ def compute_rsi(series, period=14):
 
 def compute_indicators(df):
     df = df.copy()
+
     df["rsi"] = compute_rsi(df["close"])
     df["ma_fast"] = df["close"].rolling(10).mean()
     df["ma_slow"] = df["close"].rolling(50).mean()
     df["volatility"] = df["close"].pct_change().rolling(20).std()
     df["volume_avg"] = df["volume"].rolling(20).mean()
+
     return df
 
-# ============== SIGNAL ENGINE ===================
+# ================= SIGNAL ENGINE =================
 
 def generate_signal(symbol, df):
 
@@ -130,14 +148,17 @@ def generate_signal(symbol, df):
 
     price = latest["close"]
 
+    # spread filter
     spread = abs(df["high"].iloc[-1] - df["low"].iloc[-1]) / (price + 1e-9)
     if spread > MAX_SPREAD:
         return None
 
+    # momentum filter
     recent_move = abs(df["close"].pct_change().iloc[-1])
     if pd.isna(recent_move) or recent_move < MIN_MOVE:
         return None
 
+    # volume filter
     if latest["volume"] < latest["volume_avg"]:
         return None
 
@@ -164,41 +185,41 @@ def generate_signal(symbol, df):
         price < df["close"].rolling(10).mean().iloc[-1]
     )
 
-    signal = None
-
     if breakout_up:
-        signal = "BUY"
-    elif breakout_down:
-        signal = "SELL"
-    elif trend_up and rsi < 40:
-        signal = "BUY"
-    elif trend_down and rsi > 60:
-        signal = "SELL"
+        return "BUY"
+    if breakout_down:
+        return "SELL"
+    if trend_up and rsi < 40:
+        return "BUY"
+    if trend_down and rsi > 60:
+        return "SELL"
 
-    return signal
+    return None
 
-# ============== EXECUTION ===================
+# ================= EXECUTION =================
 
 def place_trade(symbol, signal, price):
 
+    # positions check (safe)
     try:
-        open_positions = [p.symbol for p in api.list_positions()]
+        open_positions = [p.symbol for p in safe_call(api.list_positions) or []]
     except:
         open_positions = []
 
     if symbol in open_positions:
         return
 
-    if get_daily_pnl() < DAILY_LOSS_LIMIT:
-        print("Daily loss limit hit.")
-        return
-
+    # cooldown
     now = time.time()
     if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN_SECONDS:
         return
 
+    # equity
     equity = get_equity()
-    if equity is None:
+    if not equity:
+        return
+
+    if get_daily_pnl() < DAILY_LOSS_LIMIT:
         return
 
     risk = equity * RISK_PER_TRADE
@@ -208,12 +229,12 @@ def place_trade(symbol, signal, price):
         return
 
     qty = int(risk / stop_distance)
-
     if qty <= 0:
         return
 
     try:
-        api.submit_order(
+        safe_call(
+            api.submit_order,
             symbol=symbol,
             qty=qty,
             side="buy" if signal == "BUY" else "sell",
@@ -222,11 +243,12 @@ def place_trade(symbol, signal, price):
         )
 
         last_trade_time[symbol] = now
+        print(f"TRADE {signal} {symbol} qty={qty}")
 
     except Exception as e:
         print("Order error:", e)
 
-# ============== LOOP ===================
+# ================= LOOP =================
 
 def trading_loop():
     while True:
@@ -248,7 +270,7 @@ def trading_loop():
 
         time.sleep(10)
 
-# ============== API ===================
+# ================= API =================
 
 @app.route("/")
 def home():
@@ -258,11 +280,26 @@ def home():
 def pnl():
     return jsonify({"daily_pnl": get_daily_pnl()})
 
+@app.route("/equity")
+def equity():
+    eq = get_equity()
+    if eq is None:
+        return jsonify({"status": "warming up"}), 200
+
+    with lock:
+        start = daily_start_equity
+
+    return jsonify({
+        "current_equity": eq,
+        "start_equity": start,
+        "daily_pnl_pct": get_daily_pnl()
+    })
+
 @app.route("/account")
 def account():
     acc = get_account()
     if not acc:
-        return jsonify({"error": "account unavailable"}), 503
+        return jsonify({"status": "warming up"}), 200
 
     return jsonify({
         "equity": float(acc.equity),
@@ -272,22 +309,11 @@ def account():
         "status": acc.status
     })
 
-@app.route("/equity")
-def equity():
-    eq = get_equity()
-    if eq is None:
-        return jsonify({"error": "equity unavailable"}), 503
-
-    return jsonify({
-        "current_equity": eq,
-        "start_equity": daily_start_equity,
-        "daily_pnl_pct": get_daily_pnl()
-    })
-
 @app.route("/portfolio")
 def portfolio():
     try:
-        positions = api.list_positions()
+        positions = safe_call(api.list_positions) or []
+
         return jsonify([
             {
                 "symbol": p.symbol,
@@ -302,9 +328,9 @@ def portfolio():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ============== START ===================
+# ================= START =================
 
 if __name__ == "__main__":
     threading.Thread(target=account_updater, daemon=True).start()
     threading.Thread(target=trading_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, threaded=True)
