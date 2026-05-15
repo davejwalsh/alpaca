@@ -1,17 +1,53 @@
 import os
 import time
 import threading
+from collections import deque, defaultdict
+
 import numpy as np
-import pandas as pd
-from flask import Flask, jsonify
 import alpaca_trade_api as tradeapi
+from flask import Flask, jsonify
 
-# ================= CONFIG =================
+print("🔥 QUANT SYSTEM v6.1 (CLEAN PORTFOLIO ARCH)")
 
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
+# =========================================================
+# CONFIG
+# =========================================================
+CHECK_INTERVAL = 30
+COOLDOWN = 300
 
+MAX_POSITIONS = 12
+MAX_EXPOSURE = 0.80
+MIN_SIGNAL = 0.03
+
+ML_LR = 0.002
+MAX_WEIGHT = 1.0
+
+# =========================================================
+# API
+# =========================================================
+api = tradeapi.REST(
+    os.getenv("APCA_API_KEY_ID"),
+    os.getenv("APCA_API_SECRET_KEY"),
+    "https://paper-api.alpaca.markets"
+)
+
+app = Flask(__name__)
+
+# =========================================================
+# STATE
+# =========================================================
+equity_curve = deque(maxlen=2000)
+cash_curve = deque(maxlen=2000)
+
+last_trade_time = {}
+paused = False
+
+strategy_weight = {"rules": 0.45, "ml": 0.55}
+ml_weights = defaultdict(float)
+
+# =========================================================
+# UNIVERSE
+# =========================================================
 SYMBOLS = list(set([
     "AAPL","TSLA","NVDA","AMD","SPY",
     "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
@@ -31,350 +67,277 @@ SYMBOLS = list(set([
     "UBER","LYFT","ABNB","ETSY","EBAY"
 ]))
 
-TIMEFRAME = "1Min"
-LOOKBACK = 200
+# =========================================================
+# HELPERS
+# =========================================================
+def equity():
+    return float(api.get_account().equity)
 
-RISK_PER_TRADE = 0.01
-STOP_LOSS_PCT = 0.005
-COOLDOWN_SECONDS = 300
-DAILY_LOSS_LIMIT = -0.03
+def cash():
+    return float(api.get_account().cash)
 
-# ================= APP =================
+def positions():
+    return api.list_positions()
 
-app = Flask(__name__)
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
-
-positions = {}
-last_trade_time = {}
-
-cached_equity = None
-cached_account = None
-daily_start_equity = None
-lock = threading.Lock()
-
-# ================= SAFE ACCOUNT THREAD =================
-
-def account_updater():
-    global cached_equity, cached_account, daily_start_equity
-
-    while True:
-        try:
-            acc = api.get_account()
-
-            with lock:
-                cached_account = acc
-                cached_equity = float(acc.equity)
-
-                if daily_start_equity is None:
-                    daily_start_equity = cached_equity
-
-        except Exception as e:
-            print("Account update error:", e)
-
-        time.sleep(15)
-
-# ================= HELPERS =================
-
-def get_equity():
-    with lock:
-        return cached_equity
-
-def get_account():
-    with lock:
-        return cached_account
-
-def get_daily_pnl():
-    eq = get_equity()
-    if eq is None or daily_start_equity is None:
-        return 0.0
-    if daily_start_equity == 0:
-        return 0.0
-    return (eq - daily_start_equity) / daily_start_equity
-
-def calculate_position_size(price):
+def position(symbol):
     try:
-        account = get_account()
-        if not account:
-            return 0
-        
-        cash = float(account.cash)
+        p = api.get_position(symbol)
+        return float(p.avg_entry_price), int(p.qty)
+    except:
+        return None, 0
 
-        # Risk per trade (e.g. 10% of cash)
-        risk_fraction = 0.1
+# =========================================================
+# DATA
+# =========================================================
+def get_data(symbol):
+    return api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=120).df
 
-        max_trade_value = cash * risk_fraction
-
-        qty = int(max_trade_value // price)
-
-        if qty < 1:
-            return 0
-
-        return qty
-
-    except Exception as e:
-        print(f"Position size error: {e}")
+def returns(series, n):
+    if len(series) < n:
         return 0
+    return series.iloc[-1] / series.iloc[-n] - 1
 
-# ================= DATA =================
-
-def get_all_data():
+# =========================================================
+# REGIME (IMPROVED: SPY BASED)
+# =========================================================
+def market_regime():
     try:
-        bars = api.get_bars(SYMBOLS, TIMEFRAME, limit=LOOKBACK).df
-    except Exception as e:
-        print("Batch data error:", e)
-        return {}
+        df = get_data("SPY")
+        close = df["close"]
 
-    if bars is None or bars.empty:
-        return {}
+        vol = close.pct_change().rolling(30).std().iloc[-1]
+        trend = returns(close, 30)
 
-    data = {}
+        if vol > 0.035:
+            return "stress"
+        if vol > 0.02 and trend < 0:
+            return "risk_off"
+        if trend > 0.01:
+            return "risk_on"
+        return "neutral"
 
-    for symbol in SYMBOLS:
-        df = bars[bars["symbol"] == symbol]
-        if not df.empty:
-            data[symbol] = df
-    print(f"Fetched data for {len(data)} symbols", flush=True)
-    return data
+    except:
+        return "neutral"
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = -delta.clip(upper=0).rolling(period).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
+def regime_multiplier(r):
+    return {
+        "risk_on": 1.25,
+        "neutral": 1.0,
+        "risk_off": 0.6,
+        "stress": 0.25
+    }.get(r, 1.0)
 
-def compute_indicators(df):
-    df = df.copy()
-    df["rsi"] = compute_rsi(df["close"])
-    df["ma_fast"] = df["close"].rolling(10).mean()
-    df["ma_slow"] = df["close"].rolling(50).mean()
-    df["volatility"] = df["close"].pct_change().rolling(20).std()
-    df["volume_avg"] = df["volume"].rolling(20).mean()
-    return df
+# =========================================================
+# SIGNALS (NORMALISED)
+# =========================================================
+def rules_signal(df):
+    r5 = returns(df["close"], 5)
+    r20 = returns(df["close"], 20)
+    vol = df["close"].pct_change().rolling(20).std().iloc[-1] + 1e-6
 
+    return np.tanh((0.7 * r5 + 0.3 * r20) / vol)
 
-def log_decision(symbol, price, signal, reason):
-    print(f"""
-==============================
-SYMBOL: {symbol}
-PRICE: {price:.2f}
-SIGNAL: {signal}
-REASON: {reason}
-TIME: {time.strftime('%H:%M:%S')}
-==============================
-""", flush=True)
+def ml_features(df):
+    return {
+        "r5": returns(df["close"], 5),
+        "r10": returns(df["close"], 10),
+        "r20": returns(df["close"], 20),
+    }
 
+def ml_signal(symbol, df):
+    f = ml_features(df)
+    score = sum(f[k] * ml_weights[f"{symbol}_{k}"] for k in f)
+    return np.tanh(score)
 
-# ================= SIGNAL =================
+# =========================================================
+# RISK (EXPOSURE)
+# =========================================================
+def exposure():
+    acc = api.get_account()
+    eq = float(acc.equity)
+    pos = api.list_positions()
+    return sum(float(p.market_value) for p in pos) / eq
 
-def generate_signal(symbol, df):
-    if df is None or df.empty or len(df) < 60:
-        return None
+# =========================================================
+# ML LEARNING (POSITION-AWARE FIX)
+# =========================================================
+def ml_reward(entry, price, qty):
+    if qty <= 0 or entry is None:
+        return 0
+    pnl = (price - entry) / entry
+    return np.tanh(pnl * 6)
 
-    df = compute_indicators(df)
-    latest = df.iloc[-1]
+def update_ml(symbol, df, reward):
+    f = ml_features(df)
 
-    price = latest["close"]
+    for k, v in f.items():
+        key = f"{symbol}_{k}"
+        grad = reward * v
 
-    try:
-        spread = abs(df["high"].iloc[-1] - df["low"].iloc[-1]) / (price + 1e-9)
-        if spread > 0.002:
-            return None
+        ml_weights[key] += ML_LR * np.clip(grad, -1, 1)
+        ml_weights[key] = np.clip(ml_weights[key], -MAX_WEIGHT, MAX_WEIGHT)
 
-        recent_move = abs(df["close"].pct_change().iloc[-1])
-        if np.isnan(recent_move) or recent_move < 0.0015:
-            return None
+# =========================================================
+# EXECUTION
+# =========================================================
+def execute(symbol, signal, df, size):
+    price = df["close"].iloc[-1]
+    entry, qty = position(symbol)
 
-        if latest["volume"] < latest["volume_avg"]:
-            return None
-
-        trend_up = latest["ma_fast"] > latest["ma_slow"]
-        trend_down = latest["ma_fast"] < latest["ma_slow"]
-
-        rsi = latest["rsi"]
-        volatility = df["volatility"].iloc[-1]
-
-        compression = volatility < 0.01
-
-        lookback_drop = (df["close"].iloc[-20] - price) / (df["close"].iloc[-20] + 1e-9)
-
-        breakout_up = compression and lookback_drop > 0.02
-        breakout_down = compression and lookback_drop < -0.02
-       
-        if breakout_up:
-            return "BUY"
-        if breakout_down:
-            return "SELL"
-        if trend_up and rsi < 40:
-            return "BUY"
-        if trend_down and rsi > 60:
-            return "SELL"
-
-    except Exception as e:
-        print("Signal error:", symbol, e)
-    log_decision(symbol, price, None, f"No signal (RSI={rsi:.2f})")
-    return None
-
-# ================= EXECUTION =================
-
-def place_trade(symbol, signal, price):
-
-    try:
-        open_positions = {p.symbol: p for p in api.list_positions()}
-    except Exception as e:
-        print("Position fetch error:", e)
-        open_positions = {}
-
-    position = open_positions.get(symbol)
-
-    # 🚫 DAILY LOSS LIMIT
-    if get_daily_pnl() < DAILY_LOSS_LIMIT:
-        print("Daily loss limit hit.")
-        return
-
-    # ⏱ COOLDOWN
     now = time.time()
-    if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN_SECONDS:
-        return
 
-    equity = get_equity()
-    if equity is None:
-        print("No equity yet.")
-        return
-
-    # ================= BUY =================
-    if signal == "BUY":
-
-        if position:
-            # Already holding → skip
+    if symbol in last_trade_time:
+        if now - last_trade_time[symbol] < COOLDOWN:
             return
 
-        risk = equity * RISK_PER_TRADE
-        stop_distance = price * STOP_LOSS_PCT
+    if qty == 0 and signal > 0 and size > 0:
+        print(f"🟢 BUY {symbol} size={size}")
+        api.submit_order(symbol, size, "buy", "market", "gtc")
+        last_trade_time[symbol] = now
 
-        if stop_distance <= 0:
-            return
+    if qty > 0:
+        pnl = (price - entry) / entry
 
-        qty = int(risk / stop_distance)
+        if pnl < -0.02:
+            api.submit_order(symbol, qty, "sell", "market", "gtc")
 
-        if qty <= 0:
-            return
+        elif pnl > 0.10:
+            api.submit_order(symbol, qty // 2, "sell", "market", "gtc")
 
-        try:
-            print(f"EXECUTING BUY: {symbol} qty={qty} price={price}")
+        elif pnl > 0.20:
+            api.submit_order(symbol, qty, "sell", "market", "gtc")
 
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side="buy",
-                type="market",
-                time_in_force="gtc"
-            )
+# =========================================================
+# ENGINE
+# =========================================================
+def engine():
+    global paused
 
-            last_trade_time[symbol] = now
-
-        except Exception as e:
-            print("BUY error:", e)
-
-    # ================= SELL =================
-    elif signal == "SELL":
-
-        if not position:
-            return
-    
-        qty = int(float(position.qty))
-    
-        if qty <= 0:
-            return
-    
-        try:
-            print(f"EXECUTING SELL (close): {symbol} qty={qty} price={price}")
-    
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side="sell",
-                type="market",
-                time_in_force="gtc"
-            )
-    
-            last_trade_time[symbol] = now
-    
-        except Exception as e:
-            print("SELL error:", e)
-# ================= LOOP =================
-
-def trading_loop():
     while True:
-        try:
-            data_map = get_all_data()
-            for symbol, df in data_map.items():
-                if df.empty:
+        print("\n🔁 CYCLE")
+
+        if paused:
+            time.sleep(5)
+            continue
+
+        acc = api.get_account()
+        eq = float(acc.equity)
+
+        reg = market_regime()
+        reg_mult = regime_multiplier(reg)
+
+        current_exp = exposure()
+
+        scored = []
+
+        for s in SYMBOLS:
+            try:
+                df = get_data(s)
+                if len(df) < 60:
                     continue
 
-                signal = generate_signal(symbol, df)
+                r = rules_signal(df)
+                m = ml_signal(s, df)
 
-                if signal:
-                    place_trade(symbol, signal, df["close"].iloc[-1])
-                else:
-                    print("No signal")
+                signal = (strategy_weight["rules"] * r +
+                          strategy_weight["ml"] * m)
 
-        except Exception as e:
-            print("Loop error:", e)
+                momentum = returns(df["close"], 1)
 
-        time.sleep(15)
+                signal = np.tanh((signal + 0.3 * momentum) * reg_mult)
 
-# ================= ENDPOINTS =================
+                if abs(signal) < MIN_SIGNAL:
+                    continue
 
+                scored.append((s, signal, df))
+
+            except:
+                continue
+
+        if not scored:
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        scored.sort(key=lambda x: abs(x[1]), reverse=True)
+        top = scored[:MAX_POSITIONS]
+
+        available = max(0, (MAX_EXPOSURE - current_exp)) * eq
+        total = sum(abs(x[1]) for x in top) + 1e-9
+
+        print(f"📊 REGIME={reg} TOP={[x[0] for x in top]}")
+
+        for symbol, signal, df in top:
+            price = df["close"].iloc[-1]
+            entry, qty = position(symbol)
+
+            weight = abs(signal) / total
+            allocation = available * weight
+
+            size = int(allocation / price)
+            size = max(0, min(size, 15))
+
+            execute(symbol, signal, df, size)
+
+            reward = ml_reward(entry, price, qty)
+            update_ml(symbol, df, reward)
+
+        equity_curve.append(eq)
+        cash_curve.append(float(acc.cash))
+
+        print(f"💼 EQ={eq:.2f} EXP={current_exp:.2f}")
+
+        time.sleep(CHECK_INTERVAL)
+
+# =========================================================
+# API
+# =========================================================
 @app.route("/")
 def home():
-    return jsonify({"status": "running"})
+    return {"status": "running"}
 
-@app.route("/equity")
-def equity():
-    eq = get_equity()
-    if eq is None:
-        return jsonify({"error": "no equity"}), 503
-
-    return jsonify({
-        "equity": eq,
-        "start": daily_start_equity,
-        "pnl": get_daily_pnl()
-    })
-
-@app.route("/account")
-def account():
-    acc = get_account()
-    if not acc:
-        return jsonify({"error": "no account"}), 503
-
+@app.route("/status")
+def status():
+    acc = api.get_account()
     return jsonify({
         "equity": float(acc.equity),
         "cash": float(acc.cash),
-        "buying_power": float(acc.buying_power)
+        "regime": market_regime(),
+        "exposure": exposure()
     })
 
 @app.route("/portfolio")
 def portfolio():
-    try:
-        pos = api.list_positions()
-        return jsonify([
-            {
-                "symbol": p.symbol,
-                "qty": float(p.qty),
-                "unrealized": float(p.unrealized_pl)
-            }
-            for p in pos
-        ])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify([
+        {
+            "symbol": p.symbol,
+            "qty": int(p.qty),
+            "value": float(p.market_value)
+        }
+        for p in positions()
+    ])
 
-# ================= START =================
+@app.route("/ml")
+def ml_state():
+    return {
+        "sample_weights": dict(list(ml_weights.items())[:30])
+    }
+
+@app.route("/equity")
+def eq():
+    return {"equity": list(equity_curve)}
+
+@app.route("/cash")
+def cs():
+    return {"cash": list(cash_curve)}
+
+# =========================================================
+# START
+# =========================================================
+def start():
+    time.sleep(5)
+    threading.Thread(target=engine, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # 🚨 FIX FOR RAILWAY
-
-    threading.Thread(target=account_updater, daemon=True).start()
-    threading.Thread(target=trading_loop, daemon=True).start()
-
-    app.run(host="0.0.0.0", port=port)
+    print("🚀 QUANT SYSTEM v6.1 START")
+    threading.Thread(target=start, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
