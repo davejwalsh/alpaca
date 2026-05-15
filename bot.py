@@ -17,6 +17,7 @@ SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "SPY",
            "ACN","DHR","AMD","TXN","NEE","LIN","PM","UPS","ORCL","BMY",     
            "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK"]
 
+
 TIMEFRAME = "1Min"
 LOOKBACK = 200
 
