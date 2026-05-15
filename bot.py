@@ -4,10 +4,11 @@ import threading
 from collections import deque, defaultdict
 
 import numpy as np
+import pandas as pd
 import alpaca_trade_api as tradeapi
 from flask import Flask, jsonify
 
-print("🔥 QUANT SYSTEM v6.1 (STABLE WRAPPER FIX)")
+print("🔥 QUANT SYSTEM v6.1 (CLEAN PORTFOLIO ARCH)")
 
 # =========================================================
 # CONFIG
@@ -46,60 +47,65 @@ strategy_weight = {"rules": 0.45, "ml": 0.55}
 ml_weights = defaultdict(float)
 
 # =========================================================
-# CACHE (IMPORTANT FIX)
+# UNIVERSE
 # =========================================================
-cached_account = None
-cached_positions = []
-cached_equity = None
-lock = threading.Lock()
+SYMBOLS = list(set([
+    "AAPL","TSLA","NVDA","AMD","SPY",
+    "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
+    "ACN","DHR","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
+    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK",
+    "F","SOFI","PBR","T","CMCSA","DKNG","HPQ",
+    "NOK","BAC","WFC","C","CSX","KMI","VZ","UAL","DAL","CCL",
+    "RIVN","LCID","PLTR","OPEN","CHWY","SNAP",
+    "ROKU","COIN","AFRM","UPST","SHOP","SQ","PYPL",
+    "RIOT","MARA","RUN","ENPH",
+    "XOM","OXY","SLB","HAL","EOG",
+    "ADBE","NOW","CRWD","ZS","OKTA","NET","DDOG",
+    "JPM","SCHW","AXP",
+    "NKE","SBUX","TGT","COST","HD",
+    "GM",
+    "PFE","JNJ","LLY","GILD","BIIB",
+    "UBER","LYFT","ABNB","ETSY","EBAY"
+]))
 
 # =========================================================
-# SAFE WRAPPERS
+# SAFE WRAPPERS (FIX)
 # =========================================================
-def safe_call(fn, default=None, retries=3):
-    for _ in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            print("API retry:", e)
-            time.sleep(1)
-    return default
+def safe_get_account():
+    try:
+        return api.get_account()
+    except Exception as e:
+        print("ACCOUNT FETCH ERROR:", e)
+        return None
 
-# =========================================================
-# ACCOUNT THREAD
-# =========================================================
-def account_updater():
-    global cached_account, cached_equity, cached_positions
 
-    while True:
-        acc = safe_call(api.get_account)
-
-        if acc:
-            with lock:
-                cached_account = acc
-                cached_equity = float(acc.equity)
-
-        pos = safe_call(api.list_positions, default=[])
-        if pos is not None:
-            with lock:
-                cached_positions = pos
-
-        time.sleep(10)
+def safe_get_bars(symbol):
+    try:
+        return api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=120).df
+    except Exception as e:
+        print(f"BARS ERROR {symbol}: {e}")
+        return pd.DataFrame()
 
 # =========================================================
 # HELPERS
 # =========================================================
 def equity():
-    with lock:
-        return cached_equity
+    acc = safe_get_account()
+    return float(acc.equity) if acc else 0.0
+
 
 def cash():
-    with lock:
-        return float(cached_account.cash) if cached_account else 0.0
+    acc = safe_get_account()
+    return float(acc.cash) if acc else 0.0
+
 
 def positions():
-    with lock:
-        return cached_positions
+    try:
+        return api.list_positions()
+    except Exception as e:
+        print("POSITIONS ERROR:", e)
+        return []
+
 
 def position(symbol):
     try:
@@ -112,10 +118,11 @@ def position(symbol):
 # DATA
 # =========================================================
 def get_data(symbol):
-    return safe_call(
-        lambda: api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=120).df,
-        default=pd.DataFrame()
-    )
+    df = safe_get_bars(symbol)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df
+
 
 def returns(series, n):
     if len(series) < n:
@@ -123,24 +130,36 @@ def returns(series, n):
     return series.iloc[-1] / series.iloc[-n] - 1
 
 # =========================================================
-# REGIME
+# REGIME (FIXED SAFE)
 # =========================================================
 def market_regime():
-    df = get_data("SPY")
-    if df is None or df.empty:
+    try:
+        df = get_data("SPY")
+
+        if df is None or df.empty or len(df) < 30:
+            return "neutral"
+
+        close = df["close"]
+
+        vol = close.pct_change().rolling(30).std().iloc[-1]
+        trend = returns(close, 30)
+
+        if np.isnan(vol) or np.isnan(trend):
+            return "neutral"
+
+        if vol > 0.035:
+            return "stress"
+        if vol > 0.02 and trend < 0:
+            return "risk_off"
+        if trend > 0.01:
+            return "risk_on"
+
         return "neutral"
 
-    close = df["close"]
-    vol = close.pct_change().rolling(30).std().iloc[-1]
-    trend = returns(close, 30)
+    except Exception as e:
+        print("REGIME ERROR:", e)
+        return "neutral"
 
-    if vol > 0.035:
-        return "stress"
-    if vol > 0.02 and trend < 0:
-        return "risk_off"
-    if trend > 0.01:
-        return "risk_on"
-    return "neutral"
 
 def regime_multiplier(r):
     return {
@@ -159,6 +178,7 @@ def rules_signal(df):
     vol = df["close"].pct_change().rolling(20).std().iloc[-1] + 1e-6
     return np.tanh((0.7 * r5 + 0.3 * r20) / vol)
 
+
 def ml_features(df):
     return {
         "r5": returns(df["close"], 5),
@@ -166,23 +186,52 @@ def ml_features(df):
         "r20": returns(df["close"], 20),
     }
 
+
 def ml_signal(symbol, df):
     f = ml_features(df)
     score = sum(f[k] * ml_weights[f"{symbol}_{k}"] for k in f)
     return np.tanh(score)
 
 # =========================================================
-# EXPOSURE (CACHED SAFE)
+# RISK
 # =========================================================
 def exposure():
-    pos = positions()
-    eq = equity()
-    if not eq:
-        return 0
-    return sum(float(p.market_value) for p in pos) / eq
+    try:
+        acc = safe_get_account()
+        if not acc:
+            return 0.0
+
+        eq = float(acc.equity)
+        pos = positions()
+
+        return sum(float(p.market_value) for p in pos) / eq if eq else 0.0
+
+    except Exception as e:
+        print("EXPOSURE ERROR:", e)
+        return 0.0
 
 # =========================================================
-# EXECUTION (UNCHANGED LOGIC)
+# ML
+# =========================================================
+def ml_reward(entry, price, qty):
+    if qty <= 0 or entry is None:
+        return 0
+    pnl = (price - entry) / entry
+    return np.tanh(pnl * 6)
+
+
+def update_ml(symbol, df, reward):
+    f = ml_features(df)
+
+    for k, v in f.items():
+        key = f"{symbol}_{k}"
+        grad = reward * v
+
+        ml_weights[key] += ML_LR * np.clip(grad, -1, 1)
+        ml_weights[key] = np.clip(ml_weights[key], -MAX_WEIGHT, MAX_WEIGHT)
+
+# =========================================================
+# EXECUTION
 # =========================================================
 def execute(symbol, signal, df, size):
     price = df["close"].iloc[-1]
@@ -204,118 +253,140 @@ def execute(symbol, signal, df, size):
 
         if pnl < -0.02:
             api.submit_order(symbol, qty, "sell", "market", "gtc")
-
         elif pnl > 0.10:
             api.submit_order(symbol, qty // 2, "sell", "market", "gtc")
-
         elif pnl > 0.20:
             api.submit_order(symbol, qty, "sell", "market", "gtc")
 
 # =========================================================
-# ENGINE (ONLY REDUCED API LOAD)
+# ENGINE
 # =========================================================
 def engine():
     global paused
 
     while True:
-        print("\n🔁 CYCLE")
+        print("\n🔁 CYCLE RUNNING |", time.strftime("%H:%M:%S"), flush=True)
 
         if paused:
             time.sleep(5)
             continue
 
-        eq = equity()
-        if not eq:
-            time.sleep(CHECK_INTERVAL)
-            continue
-
-        reg = market_regime()
-        reg_mult = regime_multiplier(reg)
-        current_exp = exposure()
-
-        scored = []
-
-        for s in SYMBOLS:
-            df = get_data(s)
-            if df is None or len(df) < 60:
+        try:
+            acc = safe_get_account()
+            if not acc:
+                time.sleep(10)
                 continue
 
-            r = rules_signal(df)
-            m = ml_signal(s, df)
+            eq = float(acc.equity)
+            reg = market_regime()
+            reg_mult = regime_multiplier(reg)
+            current_exp = exposure()
 
-            signal = (strategy_weight["rules"] * r +
-                      strategy_weight["ml"] * m)
+            scored = []
 
-            momentum = returns(df["close"], 1)
+            for s in SYMBOLS:
+                df = get_data(s)
+                if df.empty or len(df) < 60:
+                    continue
 
-            signal = np.tanh((signal + 0.3 * momentum) * reg_mult)
+                r = rules_signal(df)
+                m = ml_signal(s, df)
 
-            if abs(signal) < MIN_SIGNAL:
+                signal = (strategy_weight["rules"] * r +
+                          strategy_weight["ml"] * m)
+
+                momentum = returns(df["close"], 1)
+
+                signal = np.tanh((signal + 0.3 * momentum) * reg_mult)
+
+                if abs(signal) < MIN_SIGNAL:
+                    continue
+
+                scored.append((s, signal, df))
+
+            if not scored:
+                time.sleep(CHECK_INTERVAL)
                 continue
 
-            scored.append((s, signal, df))
+            scored.sort(key=lambda x: abs(x[1]), reverse=True)
+            top = scored[:MAX_POSITIONS]
 
-        if not scored:
-            time.sleep(CHECK_INTERVAL)
-            continue
+            available = max(0, (MAX_EXPOSURE - current_exp)) * eq
+            total = sum(abs(x[1]) for x in top) + 1e-9
 
-        scored.sort(key=lambda x: abs(x[1]), reverse=True)
-        top = scored[:MAX_POSITIONS]
+            print(f"📊 REGIME={reg} TOP={[x[0] for x in top]}")
 
-        available = max(0, (MAX_EXPOSURE - current_exp)) * eq
-        total = sum(abs(x[1]) for x in top) + 1e-9
+            for symbol, signal, df in top:
+                price = df["close"].iloc[-1]
+                entry, qty = position(symbol)
 
-        print(f"📊 REGIME={reg} TOP={[x[0] for x in top]}")
+                weight = abs(signal) / total
+                allocation = available * weight
 
-        for symbol, signal, df in top:
-            price = df["close"].iloc[-1]
-            entry, qty = position(symbol)
+                size = int(allocation / price)
+                size = max(0, min(size, 15))
 
-            weight = abs(signal) / total
-            allocation = available * weight
+                execute(symbol, signal, df, size)
 
-            size = int(allocation / price)
-            size = max(0, min(size, 15))
+                reward = ml_reward(entry, price, qty)
+                update_ml(symbol, df, reward)
 
-            execute(symbol, signal, df, size)
+            equity_curve.append(eq)
+            cash_curve.append(float(acc.cash))
 
-        equity_curve.append(eq)
-        cash_curve.append(float(cash()))
+            print(f"💼 EQ={eq:.2f} EXP={current_exp:.2f}")
 
-        print(f"💼 EQ={eq:.2f} EXP={current_exp:.2f}")
+        except Exception as e:
+            print("ENGINE ERROR:", e)
 
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
-# API (NO DIRECT ALPACA CALLS)
+# API
 # =========================================================
 @app.route("/")
 def home():
     return {"status": "running"}
 
+
 @app.route("/status")
 def status():
+    acc = safe_get_account()
+    if not acc:
+        return jsonify({"error": "account unavailable"}), 503
+
     return jsonify({
-        "equity": equity(),
-        "cash": cash(),
+        "equity": float(acc.equity),
+        "cash": float(acc.cash),
         "regime": market_regime(),
         "exposure": exposure()
     })
 
+
 @app.route("/portfolio")
 def portfolio():
-    return jsonify([
-        {
-            "symbol": p.symbol,
-            "qty": int(p.qty),
-            "value": float(p.market_value)
-        }
-        for p in positions()
-    ])
+    try:
+        return jsonify([
+            {
+                "symbol": p.symbol,
+                "qty": int(p.qty),
+                "value": float(p.market_value)
+            }
+            for p in positions()
+        ])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/ml")
+def ml_state():
+    return {"sample_weights": dict(list(ml_weights.items())[:30])}
+
 
 @app.route("/equity")
 def eq():
     return {"equity": list(equity_curve)}
+
 
 @app.route("/cash")
 def cs():
@@ -326,10 +397,10 @@ def cs():
 # =========================================================
 def start():
     time.sleep(5)
-    threading.Thread(target=account_updater, daemon=True).start()
     threading.Thread(target=engine, daemon=True).start()
+
 
 if __name__ == "__main__":
     print("🚀 QUANT SYSTEM v6.1 START")
-    start()
+    threading.Thread(target=start, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
