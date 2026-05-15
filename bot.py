@@ -112,6 +112,19 @@ def compute_indicators(df):
     df["volume_avg"] = df["volume"].rolling(20).mean()
     return df
 
+
+def log_decision(symbol, price, signal, reason):
+    print(f"""
+==============================
+SYMBOL: {symbol}
+PRICE: {price:.2f}
+SIGNAL: {signal}
+REASON: {reason}
+TIME: {time.strftime('%H:%M:%S')}
+==============================
+""", flush=True)
+
+
 # ================= SIGNAL =================
 
 def generate_signal(symbol, df):
@@ -159,7 +172,7 @@ def generate_signal(symbol, df):
 
     except Exception as e:
         print("Signal error:", symbol, e)
-
+    log_decision(symbol, price, None, f"No signal (RSI={rsi:.2f})")
     return None
 
 # ================= EXECUTION =================
@@ -209,6 +222,7 @@ def place_trade(symbol, signal, price):
 
     except Exception as e:
         print("Order error:", e)
+    print(f"EXECUTING TRADE: {signal} {symbol} qty={qty} price={price}", flush=True)
 
 # ================= LOOP =================
 
