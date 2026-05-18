@@ -14,11 +14,14 @@ print("🔥 QUANT SYSTEM v6.1 (CLEAN PORTFOLIO ARCH)")
 # CONFIG
 # =========================================================
 CHECK_INTERVAL = 30
-COOLDOWN = 300
+COOLDOWN = 200
 
-MAX_POSITIONS = 12
+
 MAX_EXPOSURE = 0.80
-MIN_SIGNAL = 0.03
+
+
+MAX_POSITIONS = 5
+MIN_SIGNAL = 0.06
 
 ML_LR = 0.002
 MAX_WEIGHT = 1.0
@@ -44,7 +47,7 @@ last_trade_time = {}
 paused = False
 
 strategy_weight = {"rules": 0.45, "ml": 0.55}
-ml_weights = defaultdict(float)
+ml_weights = defaultdict(lambda: np.random.uniform(-0.01, 0.01))
 
 # =========================================================
 # UNIVERSE
@@ -142,6 +145,8 @@ def market_regime():
         close = df["close"]
 
         vol = close.pct_change().rolling(30).std().iloc[-1]
+        if vol < 0.002:
+            return "neutral"
         trend = returns(close, 30)
 
         if np.isnan(vol) or np.isnan(trend):
@@ -175,8 +180,12 @@ def regime_multiplier(r):
 def rules_signal(df):
     r5 = returns(df["close"], 5)
     r20 = returns(df["close"], 20)
-    vol = df["close"].pct_change().rolling(20).std().iloc[-1] + 1e-6
-    return np.tanh((0.7 * r5 + 0.3 * r20) / vol)
+    r60 = returns(df["close"], 60)
+
+    trend = 0.5 * r20 + 0.5 * r60
+    short = r5
+
+    return np.tanh((short + trend) * 5)
 
 
 def ml_features(df):
@@ -241,7 +250,8 @@ def execute(symbol, signal, df, size):
 
     if symbol in last_trade_time:
         if now - last_trade_time[symbol] < COOLDOWN:
-            return
+            if signal < 0.12:
+                return
 
     if qty == 0 and signal > 0 and size > 0:
         print(f"🟢 BUY {symbol} size={size}")
@@ -250,12 +260,21 @@ def execute(symbol, signal, df, size):
 
     if qty > 0:
         pnl = (price - entry) / entry
-
-        if pnl < -0.02:
+    
+        # hard stop
+        if pnl < -0.04:
+            print(f"🔴 STOP LOSS {symbol} pnl={pnl:.3f}")
             api.submit_order(symbol, qty, "sell", "market", "gtc")
-        elif pnl > 0.10:
-            api.submit_order(symbol, qty // 2, "sell", "market", "gtc")
-        elif pnl > 0.20:
+    
+        # take partial profits but let runner live
+        elif pnl > 0.08 and qty > 1:
+            sell_qty = max(1, int(qty * 0.3))
+            print(f"💰 PARTIAL TAKE {symbol} pnl={pnl:.3f}")
+            api.submit_order(symbol, sell_qty, "sell", "market", "gtc")
+    
+        # big winner exit
+        elif pnl > 0.25:
+            print(f"🚀 FULL EXIT WINNER {symbol} pnl={pnl:.3f}")
             api.submit_order(symbol, qty, "sell", "market", "gtc")
 
 # =========================================================
@@ -297,9 +316,11 @@ def engine():
 
                 momentum = returns(df["close"], 1)
 
-                signal = np.tanh((signal + 0.3 * momentum) * reg_mult)
+                long_bias = 0.02 if reg != "risk_off" else -0.01
 
-                if abs(signal) < MIN_SIGNAL:
+                signal = np.tanh((signal + 0.3 * momentum + long_bias) * reg_mult)
+
+                if abs(signal) < MIN_SIGNAL or reg == "stress":
                     continue
 
                 scored.append((s, signal, df))
@@ -312,6 +333,8 @@ def engine():
             top = scored[:MAX_POSITIONS]
 
             available = max(0, (MAX_EXPOSURE - current_exp)) * eq
+            if current_exp < 0.3:
+                available *= 1.5
             total = sum(abs(x[1]) for x in top) + 1e-9
 
             print(f"📊 REGIME={reg} TOP={[x[0] for x in top]}")
@@ -324,7 +347,7 @@ def engine():
                 allocation = available * weight
 
                 size = int(allocation / price)
-                size = max(0, min(size, 15))
+                size = max(0, size)
 
                 execute(symbol, signal, df, size)
 
