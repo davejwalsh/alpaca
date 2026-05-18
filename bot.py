@@ -26,6 +26,8 @@ MIN_SIGNAL = 0.06
 ML_LR = 0.002
 MAX_WEIGHT = 1.0
 
+MAX_SINGLE_TRADE_PCT = 0.15
+
 # =========================================================
 # API
 # =========================================================
@@ -92,6 +94,13 @@ def safe_get_bars(symbol):
 # =========================================================
 # HELPERS
 # =========================================================
+
+def buying_power():
+    acc = safe_get_account()
+    if not acc:
+        return 0.0
+    return float(acc.buying_power)
+    
 def equity():
     acc = safe_get_account()
     return float(acc.equity) if acc else 0.0
@@ -246,6 +255,15 @@ def execute(symbol, signal, df, size):
     price = df["close"].iloc[-1]
     entry, qty = position(symbol)
 
+    bp = buying_power()
+
+    required = size * price
+    
+    if required > bp * 0.95:  # safety buffer
+        print(f"❌ SKIP {symbol} insufficient BP | need={required:.2f} have={bp:.2f}")
+        last_trade_time[symbol] = time.time()  # prevent spam retry
+        return
+
     now = time.time()
 
     if symbol in last_trade_time:
@@ -282,7 +300,7 @@ def execute(symbol, signal, df, size):
 # =========================================================
 def engine():
     global paused
-
+    executed_symbols = set()
     while True:
         print("\n🔁 CYCLE RUNNING |", time.strftime("%H:%M:%S"), flush=True)
 
@@ -332,7 +350,8 @@ def engine():
             scored.sort(key=lambda x: abs(x[1]), reverse=True)
             top = scored[:MAX_POSITIONS]
 
-            available = max(0, (MAX_EXPOSURE - current_exp)) * eq
+            bp = buying_power()
+            available = min(bp * 0.9, max(0, (MAX_EXPOSURE - current_exp)) * eq)
             if current_exp < 0.3:
                 available *= 1.5
             total = sum(abs(x[1]) for x in top) + 1e-9
@@ -345,14 +364,21 @@ def engine():
 
                 weight = abs(signal) / total
                 allocation = available * weight
-
+                allocation = min(allocation, eq * MAX_SINGLE_TRADE_PCT)
                 size = int(allocation / price)
-                size = max(0, size)
-
+                
+                if size <= 0:
+                    continue
+                
+                # hard cap
+                size = min(size, int((buying_power() * 0.9) / price))
+                if symbol in executed_symbols:
+                    continue
                 execute(symbol, signal, df, size)
-
-                reward = ml_reward(entry, price, qty)
-                update_ml(symbol, df, reward)
+                executed_symbols.add(symbol)
+                if qty > 0:
+                    reward = ml_reward(entry, price, qty)
+                    update_ml(symbol, df, reward)
 
             equity_curve.append(eq)
             cash_curve.append(float(acc.cash))
