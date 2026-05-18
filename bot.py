@@ -1,35 +1,39 @@
 import os
 import time
 import threading
-from collections import deque, defaultdict
-
 import numpy as np
 import pandas as pd
 import alpaca_trade_api as tradeapi
-from flask import Flask, jsonify
 
-print("🔥 QUANT SYSTEM v6.1 (CLEAN PORTFOLIO ARCH)")
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
+
+from collections import deque
+from flask import Flask
 
 # =========================================================
 # CONFIG
 # =========================================================
-CHECK_INTERVAL = 30
-COOLDOWN = 200
+SYMBOLS = [
+    "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META", "SPY"
+]
 
-
-MAX_EXPOSURE = 0.80
-
+LOOKAHEAD = 12  # minutes ahead
+FEE = 0.001
+SLIPPAGE = 0.001
 
 MAX_POSITIONS = 5
-MIN_SIGNAL = 0.06
+MAX_EXPOSURE = 0.80
 
-ML_LR = 0.002
-MAX_WEIGHT = 1.0
+THRESHOLD = 0.58  # prob threshold to enter
 
-MAX_SINGLE_TRADE_PCT = 0.15
+RETRAIN_EVERY = 200  # live engine steps
+CHECK_INTERVAL = 30  # seconds between scans
+
+BACKTEST_TRAIN_END = 400  # index where backtest training ends and simulation starts
 
 # =========================================================
-# API
+# API (PAPER ACCOUNT)
 # =========================================================
 api = tradeapi.REST(
     os.getenv("APCA_API_KEY_ID"),
@@ -42,414 +46,431 @@ app = Flask(__name__)
 # =========================================================
 # STATE
 # =========================================================
-equity_curve = deque(maxlen=2000)
-cash_curve = deque(maxlen=2000)
+equity_curve = deque(maxlen=5000)
 
-last_trade_time = {}
-paused = False
+model = None
+scaler = None
+model_lock = threading.Lock()
 
-strategy_weight = {"rules": 0.45, "ml": 0.55}
-ml_weights = defaultdict(lambda: np.random.uniform(-0.01, 0.01))
-
-# =========================================================
-# UNIVERSE
-# =========================================================
-SYMBOLS = list(set([
-    "AAPL","TSLA","NVDA","AMD","SPY",
-    "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
-    "ACN","DHR","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
-    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK",
-    "F","SOFI","PBR","T","CMCSA","DKNG","HPQ",
-    "NOK","BAC","WFC","C","CSX","KMI","VZ","UAL","DAL","CCL",
-    "RIVN","LCID","PLTR","OPEN","CHWY","SNAP",
-    "ROKU","COIN","AFRM","UPST","SHOP","SQ","PYPL",
-    "RIOT","MARA","RUN","ENPH",
-    "XOM","OXY","SLB","HAL","EOG",
-    "ADBE","NOW","CRWD","ZS","OKTA","NET","DDOG",
-    "JPM","SCHW","AXP",
-    "NKE","SBUX","TGT","COST","HD",
-    "GM",
-    "PFE","JNJ","LLY","GILD","BIIB",
-    "UBER","LYFT","ABNB","ETSY","EBAY"
-]))
+is_trained = False
+step_counter = 0
 
 # =========================================================
-# SAFE WRAPPERS (FIX)
+# SAFE DATA
 # =========================================================
-def safe_get_account():
+def get_bars(symbol, limit=1000):
     try:
-        return api.get_account()
+        bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit)
+        df = bars.df
+        # Ensure sorted by time
+        df = df.sort_index()
+        return df
     except Exception as e:
-        print("ACCOUNT FETCH ERROR:", e)
-        return None
-
-
-def safe_get_bars(symbol):
-    try:
-        return api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=120).df
-    except Exception as e:
-        print(f"BARS ERROR {symbol}: {e}")
+        print(f"[get_bars] error for {symbol}: {e}")
         return pd.DataFrame()
 
 # =========================================================
-# HELPERS
+# FEATURE ENGINE
 # =========================================================
+def features(df):
+    close = df["close"]
 
-def buying_power():
-    acc = safe_get_account()
-    if not acc:
-        return 0.0
-    return float(acc.buying_power)
-    
-def equity():
-    acc = safe_get_account()
-    return float(acc.equity) if acc else 0.0
+    r5 = close.pct_change(5)
+    r10 = close.pct_change(10)
+    r20 = close.pct_change(20)
 
+    vol = close.pct_change().rolling(20).std()
 
-def cash():
-    acc = safe_get_account()
-    return float(acc.cash) if acc else 0.0
+    ma10 = close.rolling(10).mean()
+    ma30 = close.rolling(30).mean()
 
+    drawdown = (close - close.rolling(30).max()) / close.rolling(30).max()
+    recovery = close.pct_change(3)
+    trend_strength = (ma10 - ma30) / ma30
 
-def positions():
-    try:
-        return api.list_positions()
-    except Exception as e:
-        print("POSITIONS ERROR:", e)
-        return []
+    feats = np.array([
+        r5.iloc[-1],
+        r10.iloc[-1],
+        r20.iloc[-1],
+        vol.iloc[-1],
+        drawdown.iloc[-1],
+        recovery.iloc[-1],
+        trend_strength.iloc[-1]
+    ])
 
-
-def position(symbol):
-    try:
-        p = api.get_position(symbol)
-        return float(p.avg_entry_price), int(p.qty)
-    except:
-        return None, 0
+    return feats
 
 # =========================================================
-# DATA
+# DATASET BUILDER
 # =========================================================
-def get_data(symbol):
-    df = safe_get_bars(symbol)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    return df
+def build_dataset(df, min_window=60, max_index=None):
+    """
+    Build X, y from df up to max_index (exclusive).
+    If max_index is None, use full df (minus LOOKAHEAD).
+    """
+    if max_index is None:
+        max_index = len(df) - LOOKAHEAD
 
+    X, y = [], []
 
-def returns(series, n):
-    if len(series) < n:
-        return 0
-    return series.iloc[-1] / series.iloc[-n] - 1
+    for i in range(min_window, max_index):
+        if i + LOOKAHEAD >= len(df):
+            break
 
-# =========================================================
-# REGIME (FIXED SAFE)
-# =========================================================
-def market_regime():
-    try:
-        df = get_data("SPY")
+        window = df.iloc[:i]
+        x = features(window)
 
-        if df is None or df.empty or len(df) < 30:
-            return "neutral"
+        # skip if features not fully formed
+        if np.isnan(x).any():
+            continue
 
-        close = df["close"]
+        current = df["close"].iloc[i]
+        future = df["close"].iloc[i + LOOKAHEAD]
+        ret = future / current - 1
 
-        vol = close.pct_change().rolling(30).std().iloc[-1]
-        if vol < 0.002:
-            return "neutral"
-        trend = returns(close, 30)
+        label = 1 if ret > 0.01 else 0
 
-        if np.isnan(vol) or np.isnan(trend):
-            return "neutral"
+        X.append(x)
+        y.append(label)
 
-        if vol > 0.035:
-            return "stress"
-        if vol > 0.02 and trend < 0:
-            return "risk_off"
-        if trend > 0.01:
-            return "risk_on"
+    if len(X) == 0:
+        return np.empty((0, 7)), np.empty((0,))
 
-        return "neutral"
-
-    except Exception as e:
-        print("REGIME ERROR:", e)
-        return "neutral"
-
-
-def regime_multiplier(r):
-    return {
-        "risk_on": 1.25,
-        "neutral": 1.0,
-        "risk_off": 0.6,
-        "stress": 0.25
-    }.get(r, 1.0)
+    return np.array(X), np.array(y)
 
 # =========================================================
-# SIGNALS
+# GENERIC TRAINER (USED BY LIVE + BACKTEST)
 # =========================================================
-def rules_signal(df):
-    r5 = returns(df["close"], 5)
-    r20 = returns(df["close"], 20)
-    r60 = returns(df["close"], 60)
+def train_on_data(data_dict, end_idx=None):
+    """
+    Train a model/scaler on a dict of {symbol: df}.
+    If end_idx is provided, only use data up to that index for each df.
+    """
+    X_all, y_all = [], []
 
-    trend = 0.5 * r20 + 0.5 * r60
-    short = r5
+    for s, df in data_dict.items():
+        if end_idx is not None:
+            max_index = min(end_idx, len(df) - LOOKAHEAD)
+        else:
+            max_index = None
 
-    return np.tanh((short + trend) * 5)
+        X, y = build_dataset(df, max_index=max_index)
+        if len(X) == 0:
+            continue
 
+        X_all.append(X)
+        y_all.append(y)
 
-def ml_features(df):
-    return {
-        "r5": returns(df["close"], 5),
-        "r10": returns(df["close"], 10),
-        "r20": returns(df["close"], 20),
-    }
+    if not X_all:
+        return None, None
 
+    X_all = np.vstack(X_all)
+    y_all = np.hstack(y_all)
 
-def ml_signal(symbol, df):
-    f = ml_features(df)
-    score = sum(f[k] * ml_weights[f"{symbol}_{k}"] for k in f)
-    return np.tanh(score)
+    bt_scaler = StandardScaler()
+    bt_scaler.fit(X_all)
+    X_all_scaled = bt_scaler.transform(X_all)
 
-# =========================================================
-# RISK
-# =========================================================
-def exposure():
-    try:
-        acc = safe_get_account()
-        if not acc:
-            return 0.0
+    bt_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
+    bt_model.fit(X_all_scaled, y_all)
 
-        eq = float(acc.equity)
-        pos = positions()
-
-        return sum(float(p.market_value) for p in pos) / eq if eq else 0.0
-
-    except Exception as e:
-        print("EXPOSURE ERROR:", e)
-        return 0.0
+    return bt_model, bt_scaler
 
 # =========================================================
-# ML
+# LIVE TRAIN
 # =========================================================
-def ml_reward(entry, price, qty):
-    if qty <= 0 or entry is None:
-        return 0
-    pnl = (price - entry) / entry
-    return np.tanh(pnl * 6)
+def train():
+    """
+    Train a fresh model and scaler on the latest data for all symbols.
+    This is used for the live engine (paper account).
+    """
+    global model, scaler, is_trained
 
+    data = {}
+    for s in SYMBOLS:
+        df = get_bars(s, 800)
+        if df.empty:
+            continue
+        data[s] = df
 
-def update_ml(symbol, df, reward):
-    f = ml_features(df)
-
-    for k, v in f.items():
-        key = f"{symbol}_{k}"
-        grad = reward * v
-
-        ml_weights[key] += ML_LR * np.clip(grad, -1, 1)
-        ml_weights[key] = np.clip(ml_weights[key], -MAX_WEIGHT, MAX_WEIGHT)
-
-# =========================================================
-# EXECUTION
-# =========================================================
-def execute(symbol, signal, df, size):
-    price = df["close"].iloc[-1]
-    entry, qty = position(symbol)
-
-    bp = buying_power()
-
-    required = size * price
-    
-    if required > bp * 0.95:  # safety buffer
-        print(f"❌ SKIP {symbol} insufficient BP | need={required:.2f} have={bp:.2f}")
-        last_trade_time[symbol] = time.time()  # prevent spam retry
+    if not data:
+        print("⚠️ No data to train on.")
         return
 
-    now = time.time()
+    new_model, new_scaler = train_on_data(data, end_idx=None)
+    if new_model is None:
+        print("⚠️ Training failed (no usable samples).")
+        return
 
-    if symbol in last_trade_time:
-        if now - last_trade_time[symbol] < COOLDOWN:
-            if signal < 0.12:
-                return
+    with model_lock:
+        model = new_model
+        scaler = new_scaler
+        is_trained = True
 
-    if qty == 0 and signal > 0 and size > 0:
-        print(f"🟢 BUY {symbol} size={size}")
-        api.submit_order(symbol, size, "buy", "market", "gtc")
-        last_trade_time[symbol] = now
-
-    if qty > 0:
-        pnl = (price - entry) / entry
-    
-        # hard stop
-        if pnl < -0.04:
-            print(f"🔴 STOP LOSS {symbol} pnl={pnl:.3f}")
-            api.submit_order(symbol, qty, "sell", "market", "gtc")
-    
-        # take partial profits but let runner live
-        elif pnl > 0.08 and qty > 1:
-            sell_qty = max(1, int(qty * 0.3))
-            print(f"💰 PARTIAL TAKE {symbol} pnl={pnl:.3f}")
-            api.submit_order(symbol, sell_qty, "sell", "market", "gtc")
-    
-        # big winner exit
-        elif pnl > 0.25:
-            print(f"🚀 FULL EXIT WINNER {symbol} pnl={pnl:.3f}")
-            api.submit_order(symbol, qty, "sell", "market", "gtc")
+    print("✅ MODEL TRAINED (LIVE)")
 
 # =========================================================
-# ENGINE
+# PREDICT PROBABILITY (LIVE)
+# =========================================================
+def predict(df):
+    with model_lock:
+        if model is None or scaler is None:
+            return 0.0
+
+        x = features(df).reshape(1, -1)
+        if np.isnan(x).any():
+            return 0.0
+
+        x_scaled = scaler.transform(x)
+        prob = model.predict_proba(x_scaled)[0, 1]
+        return float(prob)
+
+# =========================================================
+# CROSS-SECTIONAL RANKING (LIVE)
+# =========================================================
+def rank_market():
+    scores = []
+
+    for s in SYMBOLS:
+        df = get_bars(s)
+
+        if df.empty or len(df) < 100:
+            continue
+
+        prob = predict(df)
+        scores.append((s, prob, df))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    return scores[:MAX_POSITIONS]
+
+# =========================================================
+# PORTFOLIO EXECUTION (LIVE, PAPER)
+# =========================================================
+def execute_portfolio(ranked):
+    try:
+        account = api.get_account()
+        equity = float(account.equity)
+    except Exception as e:
+        print(f"[execute_portfolio] account error: {e}")
+        return
+
+    allocation_per = (equity * MAX_EXPOSURE) / MAX_POSITIONS
+
+    for symbol, prob, df in ranked:
+
+        if prob < THRESHOLD:
+            continue
+
+        price = df["close"].iloc[-1]
+
+        try:
+            pos = api.get_position(symbol)
+            qty = int(pos.qty)
+        except Exception:
+            qty = 0
+
+        target_qty = int(allocation_per / price)
+
+        # entry
+        if qty == 0 and target_qty > 0:
+            print(f"🟢 BUY {symbol} prob={prob:.2f}")
+            try:
+                api.submit_order(
+                    symbol=symbol,
+                    qty=target_qty,
+                    side="buy",
+                    type="market",
+                    time_in_force="gtc"
+                )
+            except Exception as e:
+                print(f"[execute_portfolio] buy error {symbol}: {e}")
+
+        # exit rule: prob drops below 0.5
+        elif qty > 0 and prob < 0.5:
+            print(f"🔴 EXIT {symbol} prob={prob:.2f}")
+            try:
+                api.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side="sell",
+                    type="market",
+                    time_in_force="gtc"
+                )
+            except Exception as e:
+                print(f"[execute_portfolio] sell error {symbol}: {e}")
+
+# =========================================================
+# LIVE ENGINE
 # =========================================================
 def engine():
-    global paused
-    executed_symbols = set()
-    while True:
-        print("\n🔁 CYCLE RUNNING |", time.strftime("%H:%M:%S"), flush=True)
+    global step_counter
 
-        if paused:
+    while True:
+        print("\n🔁 SCAN")
+
+        if not is_trained:
+            print("⏳ Waiting for initial training...")
             time.sleep(5)
             continue
 
-        try:
-            acc = safe_get_account()
-            if not acc:
-                time.sleep(10)
-                continue
+        ranked = rank_market()
+        execute_portfolio(ranked)
 
-            eq = float(acc.equity)
-            reg = market_regime()
-            reg_mult = regime_multiplier(reg)
-            current_exp = exposure()
+        step_counter += 1
 
-            scored = []
-
-            for s in SYMBOLS:
-                df = get_data(s)
-                if df.empty or len(df) < 60:
-                    continue
-
-                r = rules_signal(df)
-                m = ml_signal(s, df)
-
-                signal = (strategy_weight["rules"] * r +
-                          strategy_weight["ml"] * m)
-
-                momentum = returns(df["close"], 1)
-
-                long_bias = 0.02 if reg != "risk_off" else -0.01
-
-                signal = np.tanh((signal + 0.3 * momentum + long_bias) * reg_mult)
-
-                if abs(signal) < MIN_SIGNAL or reg == "stress":
-                    continue
-
-                scored.append((s, signal, df))
-
-            if not scored:
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            scored.sort(key=lambda x: abs(x[1]), reverse=True)
-            top = scored[:MAX_POSITIONS]
-
-            bp = buying_power()
-            available = min(bp * 0.9, max(0, (MAX_EXPOSURE - current_exp)) * eq)
-            if current_exp < 0.3:
-                available *= 1.5
-            total = sum(abs(x[1]) for x in top) + 1e-9
-
-            print(f"📊 REGIME={reg} TOP={[x[0] for x in top]}")
-
-            for symbol, signal, df in top:
-                price = df["close"].iloc[-1]
-                entry, qty = position(symbol)
-
-                weight = abs(signal) / total
-                allocation = available * weight
-                allocation = min(allocation, eq * MAX_SINGLE_TRADE_PCT)
-                size = int(allocation / price)
-                
-                if size <= 0:
-                    continue
-                
-                # hard cap
-                size = min(size, int((buying_power() * 0.9) / price))
-                if symbol in executed_symbols:
-                    continue
-                execute(symbol, signal, df, size)
-                executed_symbols.add(symbol)
-                if qty > 0:
-                    reward = ml_reward(entry, price, qty)
-                    update_ml(symbol, df, reward)
-
-            equity_curve.append(eq)
-            cash_curve.append(float(acc.cash))
-
-            print(f"💼 EQ={eq:.2f} EXP={current_exp:.2f}")
-
-        except Exception as e:
-            print("ENGINE ERROR:", e)
+        if step_counter % RETRAIN_EVERY == 0:
+            print("🔁 retraining (live)...")
+            train()
 
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
-# API
+# BACKTEST ENGINE
 # =========================================================
-@app.route("/")
-def home():
-    return {"status": "running"}
+def backtest():
+    """
+    Backtest using static historical data pulled once from Alpaca.
+    - Train on data up to BACKTEST_TRAIN_END.
+    - Simulate from BACKTEST_TRAIN_END onward.
+    - Walk-forward retrain every RETRAIN_EVERY steps using only past data.
+    """
+    print("▶️ Starting backtest...")
 
+    # 1) Load data once
+    data = {}
+    min_len = None
 
+    for s in SYMBOLS:
+        df = get_bars(s, 1000)
+        if df.empty or len(df) <= BACKTEST_TRAIN_END + LOOKAHEAD:
+            continue
+        data[s] = df
+        if min_len is None:
+            min_len = len(df)
+        else:
+            min_len = min(min_len, len(df))
+
+    if not data:
+        print("⚠️ No data for backtest.")
+        return []
+
+    # 2) Initial training on early segment
+    bt_model, bt_scaler = train_on_data(data, end_idx=BACKTEST_TRAIN_END)
+    if bt_model is None:
+        print("⚠️ Backtest training failed (no data).")
+        return []
+
+    cash = 100000.0
+    positions = {}  # symbol -> qty
+    equity_curve.clear()
+
+    step = 0
+    start_idx = BACKTEST_TRAIN_END
+    end_idx = min_len - LOOKAHEAD
+
+    for i in range(start_idx, end_idx):
+        step += 1
+
+        # Walk-forward retrain
+        if step % RETRAIN_EVERY == 0:
+            print(f"🔁 backtest retrain at i={i}")
+            new_model, new_scaler = train_on_data(data, end_idx=i)
+            if new_model is not None:
+                bt_model, bt_scaler = new_model, new_scaler
+            else:
+                print("⚠️ retrain failed, keeping old model.")
+
+        scores = []
+
+        for s, df in data.items():
+            if i + LOOKAHEAD >= len(df):
+                continue
+
+            window = df.iloc[:i]
+            x = features(window)
+            if np.isnan(x).any():
+                continue
+
+            x_scaled = bt_scaler.transform(x.reshape(1, -1))
+            prob = bt_model.predict_proba(x_scaled)[0, 1]
+
+            price = df["close"].iloc[i]
+            scores.append((s, prob, price))
+
+        if not scores:
+            equity_curve.append(cash)
+            continue
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top = scores[:MAX_POSITIONS]
+
+        top_symbols = [t[0] for t in top]
+
+        # 4) Sell logic: exit positions not in top
+        for s in list(positions.keys()):
+            df = data[s]
+            price = df["close"].iloc[i]
+            qty = positions[s]
+
+            if s not in top_symbols:
+                sell_price = price * (1 - FEE - SLIPPAGE)
+                cash += qty * sell_price
+                del positions[s]
+
+        # 5) Buy logic
+        alloc = cash * MAX_EXPOSURE / MAX_POSITIONS
+
+        for s, prob, price in top:
+            if prob < THRESHOLD:
+                continue
+
+            qty = int(alloc / price)
+            if qty <= 0:
+                continue
+
+            cost = qty * price * (1 + FEE + SLIPPAGE)
+            if cash >= cost:
+                cash -= cost
+                positions[s] = positions.get(s, 0) + qty
+
+        # 6) Equity calculation with correct per-symbol prices
+        equity = cash
+        for s, qty in positions.items():
+            df = data[s]
+            price = df["close"].iloc[i]
+            equity += qty * price
+
+        equity_curve.append(equity)
+
+    print("✅ Backtest complete.")
+    return list(equity_curve)
+
+# =========================================================
+# API ENDPOINTS
+# =========================================================
 @app.route("/status")
 def status():
-    acc = safe_get_account()
-    if not acc:
-        return jsonify({"error": "account unavailable"}), 503
+    return {
+        "trained": is_trained,
+        "steps": step_counter
+    }
 
-    return jsonify({
-        "equity": float(acc.equity),
-        "cash": float(acc.cash),
-        "regime": market_regime(),
-        "exposure": exposure()
-    })
-
-
-@app.route("/portfolio")
-def portfolio():
-    try:
-        return jsonify([
-            {
-                "symbol": p.symbol,
-                "qty": int(p.qty),
-                "value": float(p.market_value)
-            }
-            for p in positions()
-        ])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/ml")
-def ml_state():
-    return {"sample_weights": dict(list(ml_weights.items())[:30])}
-
-
-@app.route("/equity")
-def eq():
-    return {"equity": list(equity_curve)}
-
-
-@app.route("/cash")
-def cs():
-    return {"cash": list(cash_curve)}
+@app.route("/backtest")
+def run_backtest():
+    curve = backtest()
+    return {"equity_curve": curve}
 
 # =========================================================
-# START
+# STARTUP
 # =========================================================
 def start():
-    time.sleep(5)
+    # small delay to let environment settle (Railway, etc.)
+    time.sleep(3)
+    train()
     threading.Thread(target=engine, daemon=True).start()
 
-
 if __name__ == "__main__":
-    print("🚀 QUANT SYSTEM v6.1 START")
+    print("🚀 V5 INSTITUTIONAL SYSTEM (PAPER, AUTO)")
     threading.Thread(target=start, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
