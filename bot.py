@@ -14,9 +14,24 @@ from flask import Flask
 # =========================================================
 # CONFIG
 # =========================================================
-SYMBOLS = [
-    "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META", "SPY"
-]
+SYMBOLS = list(set([
+    "AAPL","TSLA","NVDA","AMD","SPY",
+    "PEP","KO","CRM","MRK","ABT","CVX","TMO","WMT","CSCO","MCD",
+    "ACN","DHR","TXN","NEE","LIN","PM","UPS","ORCL","BMY",
+    "QCOM","LOW","INTC","SPGI","CAT","GS","MS","BLK",
+    "F","SOFI","PBR","T","CMCSA","DKNG","HPQ",
+    "NOK","BAC","WFC","C","CSX","KMI","VZ","UAL","DAL","CCL",
+    "RIVN","LCID","PLTR","OPEN","CHWY","SNAP",
+    "ROKU","COIN","AFRM","UPST","SHOP","SQ","PYPL",
+    "RIOT","MARA","RUN","ENPH",
+    "XOM","OXY","SLB","HAL","EOG",
+    "ADBE","NOW","CRWD","ZS","OKTA","NET","DDOG",
+    "JPM","SCHW","AXP",
+    "NKE","SBUX","TGT","COST","HD",
+    "GM",
+    "PFE","JNJ","LLY","GILD","BIIB",
+    "UBER","LYFT","ABNB","ETSY","EBAY"
+]))
 
 LOOKAHEAD = 12  # minutes ahead
 FEE = 0.001
