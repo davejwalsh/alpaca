@@ -7,6 +7,7 @@ import alpaca_trade_api as tradeapi
 
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
 
 from collections import deque
 from flask import Flask
@@ -14,26 +15,25 @@ from flask import Flask
 # =========================================================
 # CONFIG
 # =========================================================
-SYMBOLS = [
-    "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META", "SPY"
-]
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META", "SPY"]
 
-LOOKAHEAD = 12  # minutes ahead
+LOOKAHEAD = 12
 FEE = 0.001
 SLIPPAGE = 0.001
 
 MAX_POSITIONS = 5
 MAX_EXPOSURE = 0.80
 
-THRESHOLD = 0.58  # prob threshold to enter
+THRESHOLD = 0.60
+EXIT_THRESHOLD = 0.45
 
-RETRAIN_EVERY = 200  # live engine steps
-CHECK_INTERVAL = 30  # seconds between scans
+RETRAIN_EVERY = 200
+CHECK_INTERVAL = 30
 
-BACKTEST_TRAIN_END = 400  # index where backtest training ends and simulation starts
+MIN_TRAIN_SAMPLES = 200
 
 # =========================================================
-# API (PAPER ACCOUNT)
+# API
 # =========================================================
 api = tradeapi.REST(
     os.getenv("APCA_API_KEY_ID"),
@@ -56,21 +56,19 @@ is_trained = False
 step_counter = 0
 
 # =========================================================
-# SAFE DATA
+# DATA
 # =========================================================
 def get_bars(symbol, limit=1000):
     try:
         bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit)
-        df = bars.df
-        # Ensure sorted by time
-        df = df.sort_index()
+        df = bars.df.sort_index()
         return df
     except Exception as e:
-        print(f"[get_bars] error for {symbol}: {e}")
+        print(f"[data] {symbol} error")
         return pd.DataFrame()
 
 # =========================================================
-# FEATURE ENGINE
+# FEATURES
 # =========================================================
 def features(df):
     close = df["close"]
@@ -86,41 +84,42 @@ def features(df):
 
     drawdown = (close - close.rolling(30).max()) / close.rolling(30).max()
     recovery = close.pct_change(3)
-    trend_strength = (ma10 - ma30) / ma30
+    trend = (ma10 - ma30) / ma30
 
-    feats = np.array([
+    return np.array([
         r5.iloc[-1],
         r10.iloc[-1],
         r20.iloc[-1],
         vol.iloc[-1],
         drawdown.iloc[-1],
         recovery.iloc[-1],
-        trend_strength.iloc[-1]
+        trend.iloc[-1]
     ])
 
-    return feats
+# =========================================================
+# FILTER (IMPORTANT)
+# =========================================================
+def passes_filter(df):
+    close = df["close"]
+
+    vol = close.pct_change().rolling(20).std().iloc[-1]
+    drawdown = (close.iloc[-1] - close.rolling(30).max().iloc[-1]) / close.rolling(30).max().iloc[-1]
+
+    if np.isnan(vol) or np.isnan(drawdown):
+        return False
+
+    return vol > 0.002 and drawdown < -0.01  # bounce setup
 
 # =========================================================
-# DATASET BUILDER
+# DATASET
 # =========================================================
-def build_dataset(df, min_window=60, max_index=None):
-    """
-    Build X, y from df up to max_index (exclusive).
-    If max_index is None, use full df (minus LOOKAHEAD).
-    """
-    if max_index is None:
-        max_index = len(df) - LOOKAHEAD
-
+def build_dataset(df, min_window=60):
     X, y = [], []
 
-    for i in range(min_window, max_index):
-        if i + LOOKAHEAD >= len(df):
-            break
-
+    for i in range(min_window, len(df) - LOOKAHEAD):
         window = df.iloc[:i]
         x = features(window)
 
-        # skip if features not fully formed
         if np.isnan(x).any():
             continue
 
@@ -128,105 +127,93 @@ def build_dataset(df, min_window=60, max_index=None):
         future = df["close"].iloc[i + LOOKAHEAD]
         ret = future / current - 1
 
-        label = 1 if ret > 0.01 else 0
+        # 3-class labeling
+        if ret > 0.003:
+            label = 1
+        elif ret < -0.003:
+            label = -1
+        else:
+            continue  # remove noise
 
         X.append(x)
         y.append(label)
 
-    if len(X) == 0:
-        return np.empty((0, 7)), np.empty((0,))
+    if not X:
+        return None, None
 
-    return np.array(X), np.array(y)
+    X = np.array(X)
+    y = np.array(y)
+
+    # convert to binary
+    y = (y == 1).astype(int)
+
+    return X, y
 
 # =========================================================
-# GENERIC TRAINER (USED BY LIVE + BACKTEST)
+# TRAIN
 # =========================================================
-def train_on_data(data_dict, end_idx=None):
-    """
-    Train a model/scaler on a dict of {symbol: df}.
-    If end_idx is provided, only use data up to that index for each df.
-    """
+def train():
+    global model, scaler, is_trained
+
     X_all, y_all = [], []
 
-    for s, df in data_dict.items():
-        if end_idx is not None:
-            max_index = min(end_idx, len(df) - LOOKAHEAD)
-        else:
-            max_index = None
+    for s in SYMBOLS:
+        df = get_bars(s, 800)
+        if df.empty:
+            continue
 
-        X, y = build_dataset(df, max_index=max_index)
-        if len(X) == 0:
+        X, y = build_dataset(df)
+        if X is None:
             continue
 
         X_all.append(X)
         y_all.append(y)
 
     if not X_all:
-        return None, None
+        print("⚠️ no data")
+        return
 
     X_all = np.vstack(X_all)
     y_all = np.hstack(y_all)
 
-    bt_scaler = StandardScaler()
-    bt_scaler.fit(X_all)
-    X_all_scaled = bt_scaler.transform(X_all)
-
-    bt_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
-    bt_model.fit(X_all_scaled, y_all)
-
-    return bt_model, bt_scaler
-
-# =========================================================
-# LIVE TRAIN
-# =========================================================
-def train():
-    """
-    Train a fresh model and scaler on the latest data for all symbols.
-    This is used for the live engine (paper account).
-    """
-    global model, scaler, is_trained
-
-    data = {}
-    for s in SYMBOLS:
-        df = get_bars(s, 800)
-        if df.empty:
-            continue
-        data[s] = df
-
-    if not data:
-        print("⚠️ No data to train on.")
+    if len(y_all) < MIN_TRAIN_SAMPLES or len(np.unique(y_all)) < 2:
+        print("⚠️ bad training data")
         return
 
-    new_model, new_scaler = train_on_data(data, end_idx=None)
-    if new_model is None:
-        print("⚠️ Training failed (no usable samples).")
-        return
+    scaler_new = StandardScaler()
+    X_scaled = scaler_new.fit_transform(X_all)
+
+    classes = np.unique(y_all)
+    weights = compute_class_weight("balanced", classes=classes, y=y_all)
+
+    model_new = SGDClassifier(loss="log_loss", max_iter=1000)
+    model_new.fit(X_scaled, y_all)
 
     with model_lock:
-        model = new_model
-        scaler = new_scaler
+        model = model_new
+        scaler = scaler_new
         is_trained = True
 
-    print("✅ MODEL TRAINED (LIVE)")
+    print("✅ trained")
 
 # =========================================================
-# PREDICT PROBABILITY (LIVE)
+# PREDICT
 # =========================================================
 def predict(df):
     with model_lock:
-        if model is None or scaler is None:
+        if model is None:
             return 0.0
 
         x = features(df).reshape(1, -1)
+
         if np.isnan(x).any():
             return 0.0
 
-        x_scaled = scaler.transform(x)
-        prob = model.predict_proba(x_scaled)[0, 1]
-        return float(prob)
+        x = scaler.transform(x)
+        return model.predict_proba(x)[0, 1]
 
 # =========================================================
-# CROSS-SECTIONAL RANKING (LIVE)
+# RANK
 # =========================================================
 def rank_market():
     scores = []
@@ -237,80 +224,54 @@ def rank_market():
         if df.empty or len(df) < 100:
             continue
 
+        if not passes_filter(df):
+            continue
+
         prob = predict(df)
         scores.append((s, prob, df))
 
     scores.sort(key=lambda x: x[1], reverse=True)
-
     return scores[:MAX_POSITIONS]
 
 # =========================================================
-# PORTFOLIO EXECUTION (LIVE, PAPER)
+# EXECUTION
 # =========================================================
 def execute_portfolio(ranked):
     try:
-        account = api.get_account()
-        equity = float(account.equity)
-    except Exception as e:
-        print(f"[execute_portfolio] account error: {e}")
+        equity = float(api.get_account().equity)
+    except:
         return
 
-    allocation_per = (equity * MAX_EXPOSURE) / MAX_POSITIONS
+    alloc = (equity * MAX_EXPOSURE) / MAX_POSITIONS
 
     for symbol, prob, df in ranked:
-
-        if prob < THRESHOLD:
-            continue
 
         price = df["close"].iloc[-1]
 
         try:
             pos = api.get_position(symbol)
             qty = int(pos.qty)
-        except Exception:
+        except:
             qty = 0
 
-        target_qty = int(allocation_per / price)
+        target = int(alloc / price)
 
-        # entry
-        if qty == 0 and target_qty > 0:
-            print(f"🟢 BUY {symbol} prob={prob:.2f}")
-            try:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=target_qty,
-                    side="buy",
-                    type="market",
-                    time_in_force="gtc"
-                )
-            except Exception as e:
-                print(f"[execute_portfolio] buy error {symbol}: {e}")
+        if qty == 0 and prob > THRESHOLD:
+            print(f"BUY {symbol} {prob:.2f}")
+            api.submit_order(symbol=symbol, qty=target, side="buy", type="market", time_in_force="gtc")
 
-        # exit rule: prob drops below 0.5
-        elif qty > 0 and prob < 0.5:
-            print(f"🔴 EXIT {symbol} prob={prob:.2f}")
-            try:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="sell",
-                    type="market",
-                    time_in_force="gtc"
-                )
-            except Exception as e:
-                print(f"[execute_portfolio] sell error {symbol}: {e}")
+        elif qty > 0 and prob < EXIT_THRESHOLD:
+            print(f"SELL {symbol} {prob:.2f}")
+            api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="gtc")
 
 # =========================================================
-# LIVE ENGINE
+# ENGINE
 # =========================================================
 def engine():
     global step_counter
 
     while True:
-        print("\n🔁 SCAN")
-
         if not is_trained:
-            print("⏳ Waiting for initial training...")
             time.sleep(5)
             continue
 
@@ -320,157 +281,33 @@ def engine():
         step_counter += 1
 
         if step_counter % RETRAIN_EVERY == 0:
-            print("🔁 retraining (live)...")
             train()
 
         time.sleep(CHECK_INTERVAL)
 
 # =========================================================
-# BACKTEST ENGINE
+# BACKTEST (SIMPLIFIED SAFE)
 # =========================================================
 def backtest():
-    """
-    Backtest using static historical data pulled once from Alpaca.
-    - Train on data up to BACKTEST_TRAIN_END.
-    - Simulate from BACKTEST_TRAIN_END onward.
-    - Walk-forward retrain every RETRAIN_EVERY steps using only past data.
-    """
-    print("▶️ Starting backtest...")
-
-    # 1) Load data once
-    data = {}
-    min_len = None
-
-    for s in SYMBOLS:
-        df = get_bars(s, 1000)
-        if df.empty or len(df) <= BACKTEST_TRAIN_END + LOOKAHEAD:
-            continue
-        data[s] = df
-        if min_len is None:
-            min_len = len(df)
-        else:
-            min_len = min(min_len, len(df))
-
-    if not data:
-        print("⚠️ No data for backtest.")
-        return []
-
-    # 2) Initial training on early segment
-    bt_model, bt_scaler = train_on_data(data, end_idx=BACKTEST_TRAIN_END)
-    if bt_model is None:
-        print("⚠️ Backtest training failed (no data).")
-        return []
-
-    cash = 100000.0
-    positions = {}  # symbol -> qty
-    equity_curve.clear()
-
-    step = 0
-    start_idx = BACKTEST_TRAIN_END
-    end_idx = min_len - LOOKAHEAD
-
-    for i in range(start_idx, end_idx):
-        step += 1
-
-        # Walk-forward retrain
-        if step % RETRAIN_EVERY == 0:
-            print(f"🔁 backtest retrain at i={i}")
-            new_model, new_scaler = train_on_data(data, end_idx=i)
-            if new_model is not None:
-                bt_model, bt_scaler = new_model, new_scaler
-            else:
-                print("⚠️ retrain failed, keeping old model.")
-
-        scores = []
-
-        for s, df in data.items():
-            if i + LOOKAHEAD >= len(df):
-                continue
-
-            window = df.iloc[:i]
-            x = features(window)
-            if np.isnan(x).any():
-                continue
-
-            x_scaled = bt_scaler.transform(x.reshape(1, -1))
-            prob = bt_model.predict_proba(x_scaled)[0, 1]
-
-            price = df["close"].iloc[i]
-            scores.append((s, prob, price))
-
-        if not scores:
-            equity_curve.append(cash)
-            continue
-
-        scores.sort(key=lambda x: x[1], reverse=True)
-        top = scores[:MAX_POSITIONS]
-
-        top_symbols = [t[0] for t in top]
-
-        # 4) Sell logic: exit positions not in top
-        for s in list(positions.keys()):
-            df = data[s]
-            price = df["close"].iloc[i]
-            qty = positions[s]
-
-            if s not in top_symbols:
-                sell_price = price * (1 - FEE - SLIPPAGE)
-                cash += qty * sell_price
-                del positions[s]
-
-        # 5) Buy logic
-        alloc = cash * MAX_EXPOSURE / MAX_POSITIONS
-
-        for s, prob, price in top:
-            if prob < THRESHOLD:
-                continue
-
-            qty = int(alloc / price)
-            if qty <= 0:
-                continue
-
-            cost = qty * price * (1 + FEE + SLIPPAGE)
-            if cash >= cost:
-                cash -= cost
-                positions[s] = positions.get(s, 0) + qty
-
-        # 6) Equity calculation with correct per-symbol prices
-        equity = cash
-        for s, qty in positions.items():
-            df = data[s]
-            price = df["close"].iloc[i]
-            equity += qty * price
-
-        equity_curve.append(equity)
-
-    print("✅ Backtest complete.")
-    return list(equity_curve)
+    print("backtest disabled in v6 (safe mode)")
+    return []
 
 # =========================================================
-# API ENDPOINTS
+# API
 # =========================================================
 @app.route("/status")
 def status():
-    return {
-        "trained": is_trained,
-        "steps": step_counter
-    }
-
-@app.route("/backtest")
-def run_backtest():
-    curve = backtest()
-    return {"equity_curve": curve}
+    return {"trained": is_trained, "steps": step_counter}
 
 # =========================================================
-# STARTUP
+# START
 # =========================================================
 def start():
-    # small delay to let environment settle (Railway, etc.)
     time.sleep(3)
     train()
     threading.Thread(target=engine, daemon=True).start()
 
 if __name__ == "__main__":
-    print("🚀 V5 INSTITUTIONAL SYSTEM (PAPER, AUTO)")
+    print("🚀 V6 STABLE")
     threading.Thread(target=start, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
