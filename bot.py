@@ -138,6 +138,12 @@ def save_weights_to_supabase():
 def load_weights_from_supabase():
     global model, scaler, is_trained
     print("🧠 Attempting to load weights")
+    files = supabase.storage.from_(BUCKET).list()
+    exists = any(f["name"] == "model_bundle.pkl" for f in files)
+    
+    if not exists:
+        print("🧠 No weights found")
+        return
     try:
         res = supabase.storage.from_(BUCKET).download("model_bundle.pkl")
 
