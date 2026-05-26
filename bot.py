@@ -501,40 +501,74 @@ def execute_portfolio(ranked):
 # =========================================================
 # ENGINE
 # =========================================================
+# =========================================================
+# ENGINE
+# =========================================================
 def engine():
-    print("🔥 ENGINE STARTED")
+
     global step_counter
+    global model
+    global scaler
+
+    print("🔥 ENGINE STARTED")
 
     while True:
-        if not market_is_open():
-            print("🌙 Market closed — sleeping")
-            time.sleep(60)
-            continue
 
-        print("\n🔁 SCAN")
+        try:
 
-        if not is_trained:
-            time.sleep(5)
-            continue
+            print("🔁 ENGINE LOOP")
 
-        ranked = rank_market()
-        execute_portfolio(ranked)
+            if not market_is_open():
+                print("🌙 Market closed — sleeping")
+                time.sleep(60)
+                continue
 
-        equity_curve.append(portfolio_state["equity"])
+            if not is_trained:
+                print("⚠️ Model not trained yet")
+                time.sleep(5)
+                continue
 
-        step_counter += 1
+            ranked = rank_market()
 
-        if step_counter % RETRAIN_EVERY == 0:
-            new_model, new_scaler = train_on_data(...)
-            with model_lock:
-                model = new_model
-                scaler = new_scaler
+            print(f"📊 Ranked symbols: {len(ranked)}")
 
-        if step_counter % SAVE_WEIGHTS_EVERY == 0:
-            save_weights_to_supabase()
+            for s, p, _ in ranked:
+                print(f"   {s}: {p:.3f}")
 
-        time.sleep(CHECK_INTERVAL)
+            execute_portfolio(ranked)
 
+            equity_curve.append(portfolio_state["equity"])
+
+            step_counter += 1
+
+            # ============================================
+            # RETRAIN
+            # ============================================
+            if step_counter % RETRAIN_EVERY == 0:
+
+                print("🧠 Retraining model...")
+
+                train()
+
+            # ============================================
+            # SAVE WEIGHTS
+            # ============================================
+            if step_counter % SAVE_WEIGHTS_EVERY == 0:
+
+                print("💾 Saving weights...")
+
+                save_weights_to_supabase()
+
+            time.sleep(CHECK_INTERVAL)
+
+        except Exception as e:
+
+            print(f"❌ ENGINE ERROR: {e}")
+
+            import traceback
+            traceback.print_exc()
+
+            time.sleep(10)
 # =========================================================
 # BACKTEST
 # =========================================================
