@@ -689,8 +689,6 @@ def get_weights_base64():
 # =========================================================
 def start():
     time.sleep(3)
-    
-    load_weights_from_supabase()
 
     if model is None or scaler is None:
         print("🧠 No weights found → training fresh model")
@@ -701,5 +699,6 @@ def start():
 
 if __name__ == "__main__":
     print("🚀 SYSTEM START")
+    load_weights_from_supabase()
     threading.Thread(target=start, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
