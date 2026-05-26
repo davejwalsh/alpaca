@@ -137,7 +137,7 @@ def save_weights_to_supabase():
 
 def load_weights_from_supabase():
     global model, scaler, is_trained
-
+    print("🧠 Attempting to load weights")
     try:
         res = supabase.storage.from_(BUCKET).download("model_bundle.pkl")
 
@@ -158,7 +158,6 @@ def load_weights_from_supabase():
         print("✅ Weights loaded from Supabase")
 
     except Exception as e:
-        # 🔥 KEY FIX: do NOT crash container
         print("⚠️ Could not load weights (will train fresh):", e)
 
         model = None
