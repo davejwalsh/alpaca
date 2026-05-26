@@ -687,8 +687,10 @@ def start():
     
     load_weights_from_supabase()
 
-    if model is None:
+    if model is None or scaler is None:
+        print("🧠 No weights found → training fresh model")
         train()
+        save_weights_to_supabase()
         
     threading.Thread(target=engine, daemon=True).start()
 
