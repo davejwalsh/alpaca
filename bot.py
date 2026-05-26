@@ -388,18 +388,42 @@ def execute_portfolio(ranked):
 
     portfolio_state["equity"] = equity
     portfolio_state["cash"] = cash
-    allocation_per = (equity * MAX_EXPOSURE) / MAX_POSITIONS
+
+    max_alloc = equity * MAX_EXPOSURE
+    allocation_per = max_alloc / MAX_POSITIONS
 
     positions_snapshot = {}
     probs_snapshot = {}
     prices_snapshot = {}
 
     for symbol, prob, df in ranked:
-        price = df["close"].iloc[-1]
+
+        # =====================================================
+        # 1. LIVE PRICE (fix stale candle issue)
+        # =====================================================
+        try:
+            trade = api.get_latest_trade(symbol)
+            live_price = float(trade.price)
+        except Exception as e:
+            print(f"[price error] {symbol}: {e}")
+            continue
+
+        # =====================================================
+        # 2. PRICE STABILITY CHECK (anti-spike filter)
+        # =====================================================
+        model_price = float(df["close"].iloc[-1])
+        drift = abs(live_price - model_price) / model_price
+
+        if drift > 0.003:  # 0.3% move since signal
+            print(f"⚠️ SKIP {symbol} price moved too fast ({drift:.3f})")
+            continue
 
         probs_snapshot[symbol] = float(prob)
-        prices_snapshot[symbol] = float(price)
+        prices_snapshot[symbol] = live_price
 
+        # =====================================================
+        # 3. POSITION CHECK
+        # =====================================================
         try:
             pos = api.get_position(symbol)
             qty = int(pos.qty)
@@ -408,43 +432,69 @@ def execute_portfolio(ranked):
 
         positions_snapshot[symbol] = qty
 
-        target_qty = int(allocation_per / price)
+        # =====================================================
+        # 4. POSITION SIZING (safer)
+        # =====================================================
+        if live_price <= 0:
+            continue
+
+        target_qty = int(allocation_per / live_price)
+
         if target_qty < 1:
             continue
 
-        if qty == 0 and prob >= THRESHOLD and target_qty > 0:
-            print(f"🟢 BUY {symbol} prob={prob:.2f}")
+        # =====================================================
+        # 5. BUY LOGIC (LIMIT ORDER)
+        # =====================================================
+        if qty == 0 and prob >= THRESHOLD:
+
+            limit_price = live_price * 1.001  # slightly above market to ensure fill
+
+            print(f"🟢 BUY {symbol} prob={prob:.2f} @ {limit_price:.2f}")
+
             try:
                 api.submit_order(
                     symbol=symbol,
                     qty=target_qty,
                     side="buy",
-                    type="market",
-                    time_in_force="gtc"
+                    type="limit",
+                    time_in_force="gtc",
+                    limit_price=round(limit_price, 2)
                 )
             except Exception as e:
-                print(f"[execute_portfolio] buy error {symbol}: {e}")
+                print(f"[BUY ERROR] {symbol}: {e}")
 
+        # =====================================================
+        # 6. SELL LOGIC (LIMIT ORDER)
+        # =====================================================
         elif qty > 0 and prob < 0.5:
-            print(f"🔴 EXIT {symbol} prob={prob:.2f}")
+
+            limit_price = live_price * 0.999  # slightly below market to ensure fill
+
+            print(f"🔴 SELL {symbol} prob={prob:.2f} @ {limit_price:.2f}")
+
             try:
                 api.submit_order(
                     symbol=symbol,
                     qty=qty,
                     side="sell",
-                    type="market",
-                    time_in_force="gtc"
+                    type="limit",
+                    time_in_force="gtc",
+                    limit_price=round(limit_price, 2)
                 )
             except Exception as e:
-                print(f"[execute_portfolio] sell error {symbol}: {e}")
+                print(f"[SELL ERROR] {symbol}: {e}")
 
-    portfolio_state = {
+    # =====================================================
+    # 7. UPDATE STATE (IMPORTANT FIX)
+    # =====================================================
+    portfolio_state.update({
         "positions": positions_snapshot,
         "last_probs": probs_snapshot,
         "last_prices": prices_snapshot,
         "equity": equity,
         "cash": cash
-    }
+    })
 
     print(f"💼 Equity: {equity:.2f} | Cash: {cash:.2f}")
 
