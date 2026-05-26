@@ -122,9 +122,12 @@ def save_weights_to_supabase():
 
         try:
             supabase.storage.from_(BUCKET).upload(
-                "model_bundle.pkl",
-                buffer.getvalue(),
-                {"content-type": "application/octet-stream", "upsert": True}
+                path="model_bundle.pkl",
+                file=buffer.getvalue(),
+                file_options={
+                    "content-type": "application/octet-stream",
+                    "upsert": "true"
+                }
             )
             print("✅ Weights saved to Supabase")
         except Exception as e:
