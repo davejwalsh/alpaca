@@ -11,6 +11,13 @@ from sklearn.preprocessing import StandardScaler
 from collections import deque
 from flask import Flask
 
+import joblib
+import io
+from supabase import create_client
+
+from datetime import datetime
+import pytz
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -42,10 +49,19 @@ MAX_EXPOSURE = 0.80
 
 THRESHOLD = 0.58  # prob threshold to enter
 
-RETRAIN_EVERY = 200  # live engine steps
+RETRAIN_EVERY = 500  # live engine steps
+SAVE_WEIGHTS_EVERY = 500
 CHECK_INTERVAL = 30  # seconds between scans
 
 BACKTEST_TRAIN_END = 400  # index where backtest training ends and simulation starts
+
+BAR_CACHE = {}
+BAR_CACHE_TS = {}
+BAR_CACHE_TTL = 60  
+
+clock_lock = threading.Lock()
+_last_clock_check = 0
+_cached_open = False
 
 # =========================================================
 # API (PAPER ACCOUNT)
@@ -79,15 +95,108 @@ portfolio_state = {
     "cash": 0.0
 }
 
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+)
+
+BUCKET = "weights"
+
+def save_weights_to_supabase():
+    global model, scaler
+
+    with model_lock:
+        if model is None or scaler is None:
+            print("⚠️ No model to save")
+            return
+
+        buffer = io.BytesIO()
+
+        joblib.dump(
+            {
+                "model": model,
+                "scaler": scaler
+            },
+            buffer
+        )
+
+        buffer.seek(0)
+
+        path = "model_bundle.pkl"
+
+        try:
+            supabase.storage.from_(BUCKET).upload(
+                path,
+                buffer.getvalue(),
+                {"content-type": "application/octet-stream", "upsert": True}
+            )
+            print("✅ Weights saved to Supabase")
+        except Exception as e:
+            print("❌ Supabase save error:", e)
+
+
+def load_weights_from_supabase():
+    global model, scaler, is_trained
+
+    try:
+        res = supabase.storage.from_(BUCKET).download("model_bundle.pkl")
+        if not res:
+            print("⚠️ No saved weights found")
+            return
+        if hasattr(res, "read"):
+            data = joblib.load(io.BytesIO(res.read()))
+        else:
+            data = joblib.load(io.BytesIO(res))
+
+        with model_lock:
+            model = data["model"]
+            scaler = data["scaler"]
+            is_trained = True
+
+        print("✅ Weights loaded from Supabase")
+
+    except Exception as e:
+        print("❌ Load weights error:", e)
+
+
+def market_is_open():
+    global _last_clock_check, _cached_open
+
+    with clock_lock:
+        now = time.time()
+        if now - _last_clock_check < 60:
+            return _cached_open
+
+        try:
+            clock = api.get_clock()
+            _cached_open = clock.is_open
+            _last_clock_check = now
+            return _cached_open
+        except:
+            return False
 # =========================================================
 # SAFE DATA
 # =========================================================
 def get_bars(symbol, limit=1000):
+    now = time.time()
+
+    if len(BAR_CACHE) > 500:
+        BAR_CACHE.clear()
+        BAR_CACHE_TS.clear()
+
+    if symbol in BAR_CACHE:
+        if now - BAR_CACHE_TS[symbol] < BAR_CACHE_TTL:
+            return BAR_CACHE[symbol]
+
     try:
         bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit)
-        df = bars.df
-        df = df.sort_index()
+        df = bars.df.sort_index()
+
+        BAR_CACHE[symbol] = df
+        BAR_CACHE_TS[symbol] = now
+
         return df
+
     except Exception as e:
         print(f"[get_bars] error for {symbol}: {e}")
         return pd.DataFrame()
@@ -96,6 +205,7 @@ def get_bars(symbol, limit=1000):
 # FEATURE ENGINE
 # =========================================================
 def features(df):
+
     close = df["close"]
 
     r5 = close.pct_change(5)
@@ -109,7 +219,7 @@ def features(df):
 
     drawdown = (close - close.rolling(30).max()) / close.rolling(30).max()
     recovery = close.pct_change(3)
-    trend_strength = (ma10 - ma30) / ma30
+    trend_strength = (ma10 - ma30) / (ma30 + 1e-9)
 
     feats = np.array([
         r5.iloc[-1],
@@ -190,7 +300,7 @@ def train_on_data(data_dict, end_idx=None):
     bt_scaler.fit(X_all)
     X_all_scaled = bt_scaler.transform(X_all)
 
-    bt_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
+    bt_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3,class_weight="balanced")
     bt_model.fit(X_all_scaled, y_all)
 
     return bt_model, bt_scaler
@@ -247,12 +357,16 @@ def predict(df):
 def rank_market():
     scores = []
 
+    cached = {}
+
     for s in SYMBOLS:
         df = get_bars(s)
-
         if df.empty or len(df) < 100:
             continue
 
+        cached[s] = df
+
+    for s, df in cached.items():
         prob = predict(df)
         scores.append((s, prob, df))
 
@@ -263,7 +377,6 @@ def rank_market():
 # EXECUTION
 # =========================================================
 def execute_portfolio(ranked):
-    global portfolio_state
 
     try:
         account = api.get_account()
@@ -273,6 +386,8 @@ def execute_portfolio(ranked):
         print(f"[execute_portfolio] account error: {e}")
         return
 
+    portfolio_state["equity"] = equity
+    portfolio_state["cash"] = cash
     allocation_per = (equity * MAX_EXPOSURE) / MAX_POSITIONS
 
     positions_snapshot = {}
@@ -294,6 +409,8 @@ def execute_portfolio(ranked):
         positions_snapshot[symbol] = qty
 
         target_qty = int(allocation_per / price)
+        if target_qty < 1:
+            continue
 
         if qty == 0 and prob >= THRESHOLD and target_qty > 0:
             print(f"🟢 BUY {symbol} prob={prob:.2f}")
@@ -338,6 +455,10 @@ def engine():
     global step_counter
 
     while True:
+        if not market_is_open():
+            print("🌙 Market closed — sleeping")
+            time.sleep(60)
+            continue
         print("\n🔁 SCAN")
 
         if not is_trained:
@@ -354,6 +475,9 @@ def engine():
 
         if step_counter % RETRAIN_EVERY == 0:
             train()
+
+        if step_counter % SAVE_WEIGHTS_EVERY == 0:
+            save_weights_to_supabase()
 
         time.sleep(CHECK_INTERVAL)
 
@@ -384,11 +508,19 @@ def backtest():
     positions = {}
     equity_curve.clear()
 
+    cost_factor = 1 + FEE + SLIPPAGE
+    sell_factor = 1 - FEE - SLIPPAGE
+
     for i in range(BACKTEST_TRAIN_END, min_len - LOOKAHEAD):
+
         scores = []
 
+        # -------------------------
+        # PREDICTIONS
+        # -------------------------
         for s, df in data.items():
             window = df.iloc[:i]
+
             x = features(window)
             if np.isnan(x).any():
                 continue
@@ -402,25 +534,42 @@ def backtest():
         scores.sort(key=lambda x: x[1], reverse=True)
         top = scores[:MAX_POSITIONS]
 
+        top_symbols = {t[0] for t in top}
+
+        # -------------------------
+        # EXIT POSITIONS NOT IN TOP
+        # -------------------------
         for s in list(positions.keys()):
-            if s not in [t[0] for t in top]:
+            if s not in top_symbols:
                 price = data[s]["close"].iloc[i]
-                cash += positions[s] * price
+                cash += positions[s] * price * sell_factor
                 del positions[s]
 
+        # -------------------------
+        # ENTRY
+        # -------------------------
         alloc = cash * MAX_EXPOSURE / MAX_POSITIONS
 
         for s, prob, price in top:
             if prob < THRESHOLD:
                 continue
 
-            qty = int(alloc / price)
-            cost = qty * price
+            raw_qty = alloc / price
+
+            if raw_qty < 1:
+                continue
+
+            qty = int(raw_qty)
+
+            cost = qty * price * cost_factor
 
             if cash >= cost:
                 cash -= cost
                 positions[s] = qty
 
+        # -------------------------
+        # EQUITY CALCULATION
+        # -------------------------
         equity = cash + sum(
             positions[s] * data[s]["close"].iloc[i]
             for s in positions
@@ -452,12 +601,39 @@ def equity():
 def run_backtest():
     return {"equity_curve": backtest()}
 
+import base64
+
+@app.route("/weights/base64", methods=["GET"])
+def get_weights_base64():
+    try:
+        res = supabase.storage.from_(BUCKET).download("model_bundle.pkl")
+
+        if not res:
+            return {"error": "no weights found"}, 404
+
+        data = res.read() if hasattr(res, "read") else res
+
+        encoded = base64.b64encode(data).decode("utf-8")
+
+        return {
+            "filename": "model_bundle.pkl",
+            "content_base64": encoded
+        }
+
+    except Exception as e:
+        return {"error": str(e)}, 500
+
 # =========================================================
 # START
 # =========================================================
 def start():
     time.sleep(3)
-    train()
+    
+    load_weights_from_supabase()
+
+    if model is None:
+        train()
+        
     threading.Thread(target=engine, daemon=True).start()
 
 if __name__ == "__main__":
