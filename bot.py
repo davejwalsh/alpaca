@@ -245,8 +245,8 @@ def build_dataset(df, min_window=60, max_index=None):
         max_index = len(df) - LOOKAHEAD
 
     X, y = [], []
-
-    for i in range(min_window, max_index):
+    STEP = 5
+    for i in range(min_window, max_index, STEP):
         if i + LOOKAHEAD >= len(df):
             break
 
@@ -260,7 +260,11 @@ def build_dataset(df, min_window=60, max_index=None):
         future = df["close"].iloc[i + LOOKAHEAD]
         ret = future / current - 1
 
-        label = 1 if ret > 0.01 else 0
+        volatility = df["close"].pct_change().rolling(20).std().iloc[i]
+        
+        threshold = max(0.0005, volatility * 0.5)
+        
+        label = 1 if ret > threshold else 0
 
         X.append(x)
         y.append(label)
