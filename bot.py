@@ -140,24 +140,30 @@ def load_weights_from_supabase():
 
     try:
         res = supabase.storage.from_(BUCKET).download("model_bundle.pkl")
+
+        # Supabase returns bytes OR raises error depending on state
         if not res:
-            print("⚠️ No saved weights found")
+            print("⚠️ No saved weights found (first run expected)")
             return
-        if hasattr(res, "read"):
-            data = joblib.load(io.BytesIO(res.read()))
-        else:
-            data = joblib.load(io.BytesIO(res))
+
+        data = res.read() if hasattr(res, "read") else res
+
+        obj = joblib.load(io.BytesIO(data))
 
         with model_lock:
-            model = data["model"]
-            scaler = data["scaler"]
+            model = obj["model"]
+            scaler = obj["scaler"]
             is_trained = True
 
         print("✅ Weights loaded from Supabase")
 
     except Exception as e:
-        print("❌ Load weights error:", e)
+        # 🔥 KEY FIX: do NOT crash container
+        print("⚠️ Could not load weights (will train fresh):", e)
 
+        model = None
+        scaler = None
+        is_trained = False
 
 def market_is_open():
     global _last_clock_check, _cached_open
