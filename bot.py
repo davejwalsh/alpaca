@@ -145,6 +145,7 @@ def load_weights_from_supabase():
         print("🧠 No weights found")
         return
     try:
+        print("🧠 Getting wieghts")
         res = supabase.storage.from_(BUCKET).download("model_bundle.pkl")
 
         # Supabase returns bytes OR raises error depending on state
@@ -647,35 +648,6 @@ def train_on_data(data_dict, end_idx=None):
 
     return bt_model, bt_scaler
 
-# =========================================================
-# LIVE TRAIN
-# =========================================================
-def train():
-    global model, scaler, is_trained
-
-    data = {}
-    for s in SYMBOLS:
-        df = get_bars(s, 800)
-        if df.empty:
-            continue
-        data[s] = df
-
-    if not data:
-        print("⚠️ No data to train on.")
-        return
-
-    new_model, new_scaler = train_on_data(data)
-
-    if new_model is None:
-        print("⚠️ Training skipped.")
-        return
-
-    with model_lock:
-        model = new_model
-        scaler = new_scaler
-        is_trained = True
-
-    print("✅ MODEL TRAINED")
 
 # =========================================================
 # PREDICT
@@ -1400,13 +1372,14 @@ def start():
         try:
             train()
             save_weights_to_supabase()
-        catch Exception e:
-            print(e)
-        
+        except Exception as e:
+            print(f"[start] training error: {e}")
+
     threading.Thread(target=engine, daemon=True).start()
 
 if __name__ == "__main__":
     print("🚀 SYSTEM START")
     load_weights_from_supabase()
+    print("🚀 Weight loading finished, starting...")
     threading.Thread(target=start, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
