@@ -120,18 +120,21 @@ def save_weights_to_supabase():
         joblib.dump({"model": model, "scaler": scaler}, buffer)
         buffer.seek(0)
 
-        try:
-            supabase.storage.from_(BUCKET).upload(
-                path="model_bundle.pkl",
-                file=buffer.getvalue(),
-                file_options={
-                    "content-type": "application/octet-stream",
-                    "upsert": "true"
-                }
-            )
-            print("✅ Weights saved to Supabase")
-        except Exception as e:
-            print("❌ Supabase save error:", e)
+        data = buffer.read()   # ✅ FORCE BYTES CLEANLY
+
+    try:
+        res = supabase.storage.from_(BUCKET).upload(
+            "model_bundle.pkl",
+            data,
+            file_options={
+                "content-type": "application/octet-stream",
+                "upsert": "true"
+            }
+        )
+        print("✅ Weights saved to Supabase")
+
+    except Exception as e:
+        print("❌ Supabase save error:", e)
 
 
 def load_weights_from_supabase():
