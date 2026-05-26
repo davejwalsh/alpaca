@@ -47,7 +47,7 @@ SLIPPAGE = 0.001
 MAX_POSITIONS = 5
 MAX_EXPOSURE = 0.80
 
-THRESHOLD = 0.58
+THRESHOLD = 0.52
 
 RETRAIN_EVERY = 500
 SAVE_WEIGHTS_EVERY = 500
@@ -652,6 +652,35 @@ def get_weights_base64():
     except Exception as e:
         return {"error": str(e)}, 500
 
+@app.route("/signals")
+def signals():
+
+    if not is_trained:
+        return {"error": "model not trained"}
+
+    ranked = rank_market()
+
+    output = []
+
+    for symbol, prob, df in ranked:
+
+        try:
+            latest_price = float(df["close"].iloc[-1])
+        except:
+            latest_price = None
+
+        output.append({
+            "symbol": symbol,
+            "probability": round(prob, 4),
+            "price": latest_price
+        })
+
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "threshold": THRESHOLD,
+        "signals": output
+    }
+    
 # =========================================================
 # START
 # =========================================================
@@ -660,8 +689,8 @@ def run_engine():
 
 
 def run_flask():
-    print("🌐 Flask API starting on http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    print("🌐 Flask API starting on http://0.0.0.0:8080")
+    app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
 
 
 def start():
