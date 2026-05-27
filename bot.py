@@ -45,9 +45,9 @@ FEE = 0.001
 SLIPPAGE = 0.001
 
 MAX_POSITIONS = 5
-MAX_EXPOSURE = 0.80
+MAX_EXPOSURE = 0.40
 
-THRESHOLD = 0.52
+THRESHOLD = 0.6
 
 RETRAIN_EVERY = 500
 SAVE_WEIGHTS_EVERY = 500
@@ -62,6 +62,9 @@ BAR_CACHE_TTL = 60
 SIGNAL_CACHE = {}
 SIGNAL_CACHE_TS = {}
 SIGNAL_CACHE_TTL = 60  # seconds (tune this)
+
+LAST_TRADE_TS = {}
+TRADE_COOLDOWN = 300
 
 clock_lock = threading.Lock()
 _last_clock_check = 0
@@ -94,6 +97,7 @@ portfolio_state = {
     "positions": {},
     "last_probs": {},
     "last_prices": {},
+    "entry_prices": {},
     "equity": 0.0,
     "cash": 0.0
 }
@@ -398,16 +402,23 @@ def rank_market():
         scores.append((s, prob, df))
 
     scores.sort(key=lambda x: x[1], reverse=True)
-    return scores[:MAX_POSITIONS]
+    filtered = [
+        x for x in scores
+        if x[1] >= THRESHOLD
+    ]
+    
+    return filtered[:MAX_POSITIONS]
 
 # =========================================================
 # EXECUTION
 # =========================================================
 def execute_portfolio(ranked):
+
     try:
         account = api.get_account()
         equity = float(account.equity)
         cash = float(account.cash)
+
     except Exception as e:
         print(f"[execute_portfolio] account error: {e}")
         return
@@ -415,78 +426,175 @@ def execute_portfolio(ranked):
     portfolio_state["equity"] = equity
     portfolio_state["cash"] = cash
 
-    max_alloc = equity * MAX_EXPOSURE
-    allocation_per = max_alloc / MAX_POSITIONS
+    # =====================================================
+    # ONLY USE PART OF EQUITY
+    # =====================================================
+    usable_equity = equity * MAX_EXPOSURE
 
     positions_snapshot = {}
     probs_snapshot = {}
     prices_snapshot = {}
 
+    # =====================================================
+    # COUNT CURRENT OPEN POSITIONS
+    # =====================================================
+    current_positions = api.list_positions()
+    num_open = len(current_positions)
+
+    remaining_slots = max(1, MAX_POSITIONS - num_open)
+
+    allocation_per = usable_equity / MAX_POSITIONS
+
     for symbol, prob, df in ranked:
 
         try:
+
+            # =============================================
+            # LIVE PRICE
+            # =============================================
             trade = api.get_latest_trade(symbol)
             live_price = float(trade.price)
+
+            probs_snapshot[symbol] = prob
+            prices_snapshot[symbol] = live_price
+
+            # =============================================
+            # CURRENT POSITION
+            # =============================================
+            try:
+                pos = api.get_position(symbol)
+                qty = int(pos.qty)
+
+            except Exception:
+                qty = 0
+
+            positions_snapshot[symbol] = qty
+
+            # =============================================
+            # ENTRY PRICE
+            # =============================================
+            entry_price = portfolio_state["entry_prices"].get(symbol)
+
+            # =============================================
+            # STOP LOSS
+            # =============================================
+            if qty > 0 and entry_price:
+
+                pnl_pct = (live_price - entry_price) / entry_price
+
+                if pnl_pct <= -0.01:
+
+                    print(f"🛑 STOP LOSS SELL {symbol} pnl={pnl_pct:.3f}")
+
+                    try:
+
+                        api.submit_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side="sell",
+                            type="market",
+                            time_in_force="day"
+                        )
+
+                        portfolio_state["entry_prices"].pop(symbol, None)
+
+                    except Exception as e:
+                        print(f"[STOP SELL ERROR] {symbol}: {e}")
+
+                    continue
+
+            # =============================================
+            # PRICE DRIFT CHECK
+            # =============================================
+            model_price = float(df["close"].iloc[-1])
+
+            drift = abs(live_price - model_price) / model_price
+
+            if drift > 0.005:
+                print(f"⚠️ SKIP {symbol} drift={drift:.3f}")
+                continue
+
+            # =============================================
+            # POSITION SIZE
+            # =============================================
+            if live_price <= 0:
+                continue
+
+            target_qty = int(allocation_per / live_price)
+
+            if target_qty < 1:
+                continue
+
+            # =============================================
+            # BUY
+            # =============================================
+            if qty == 0 and prob >= THRESHOLD:
+
+                # cooldown
+                last_trade = LAST_TRADE_TS.get(symbol, 0)
+
+                if time.time() - last_trade < TRADE_COOLDOWN:
+                    print(f"⏳ Cooldown {symbol}")
+                    continue
+
+                # don't exceed max positions
+                if num_open >= MAX_POSITIONS:
+                    continue
+
+                # require stronger confidence
+                if prob < 0.60:
+                    continue
+
+                print(f"🟢 BUY {symbol} prob={prob:.3f}")
+
+                try:
+
+                    api.submit_order(
+                        symbol=symbol,
+                        qty=target_qty,
+                        side="buy",
+                        type="market",
+                        time_in_force="day"
+                    )
+
+                    portfolio_state["entry_prices"][symbol] = live_price
+
+                    LAST_TRADE_TS[symbol] = time.time()
+
+                    num_open += 1
+
+                except Exception as e:
+                    print(f"[BUY ERROR] {symbol}: {e}")
+
+            # =============================================
+            # SELL
+            # =============================================
+            elif qty > 0 and prob < 0.48:
+
+                print(f"🔴 SELL {symbol} prob={prob:.3f}")
+
+                try:
+
+                    api.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side="sell",
+                        type="market",
+                        time_in_force="day"
+                    )
+
+                    portfolio_state["entry_prices"].pop(symbol, None)
+
+                    LAST_TRADE_TS[symbol] = time.time()
+
+                    num_open -= 1
+
+                except Exception as e:
+                    print(f"[SELL ERROR] {symbol}: {e}")
+
         except Exception as e:
-            print(f"[price error] {symbol}: {e}")
-            continue
 
-        model_price = float(df["close"].iloc[-1])
-        drift = abs(live_price - model_price) / model_price
-
-        if drift > 0.003:
-            print(f"⚠️ SKIP {symbol} price moved too fast ({drift:.3f})")
-            continue
-
-        probs_snapshot[symbol] = prob
-        prices_snapshot[symbol] = live_price
-
-        try:
-            pos = api.get_position(symbol)
-            qty = int(pos.qty)
-        except Exception:
-            qty = 0
-
-        positions_snapshot[symbol] = qty
-
-        if live_price <= 0:
-            continue
-
-        target_qty = int(allocation_per / live_price)
-        if target_qty < 1:
-            continue
-
-        if qty == 0 and prob >= THRESHOLD:
-            limit_price = live_price * 1.001
-            print(f"🟢 BUY {symbol} prob={prob:.2f} @ {limit_price:.2f}")
-
-            try:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=target_qty,
-                    side="buy",
-                    type="limit",
-                    time_in_force="gtc",
-                    limit_price=round(limit_price, 2)
-                )
-            except Exception as e:
-                print(f"[BUY ERROR] {symbol}: {e}")
-
-        elif qty > 0 and prob < 0.5:
-            limit_price = live_price * 0.999
-            print(f"🔴 SELL {symbol} prob={prob:.2f} @ {limit_price:.2f}")
-
-            try:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="sell",
-                    type="limit",
-                    time_in_force="gtc",
-                    limit_price=round(limit_price, 2)
-                )
-            except Exception as e:
-                print(f"[SELL ERROR] {symbol}: {e}")
+            print(f"[symbol loop error] {symbol}: {e}")
 
     portfolio_state.update({
         "positions": positions_snapshot,
