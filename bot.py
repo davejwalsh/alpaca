@@ -459,7 +459,7 @@ def rank_market():
         if x[1] >= THRESHOLD
     ]
     
-    # return filtered[:MAX_POSITIONS]
+    return filtered[:MAX_POSITIONS]
 
 # =========================================================
 # EXECUTION
