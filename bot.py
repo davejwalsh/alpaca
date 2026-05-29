@@ -66,6 +66,12 @@ SIGNAL_CACHE_TTL = 60  # seconds (tune this)
 LAST_TRADE_TS = {}
 TRADE_COOLDOWN = 300
 
+STALE_TIME = 60 * 60 * 12
+STALE_THRESHOLD = 0.01
+TAKE_PROFIT = 0.03
+
+STOP_LOSS = -0.03
+
 clock_lock = threading.Lock()
 _last_clock_check = 0
 _cached_open = False
@@ -80,6 +86,7 @@ api = tradeapi.REST(
 )
 
 app = Flask(__name__)
+
 
 # =========================================================
 # STATE
@@ -98,6 +105,7 @@ portfolio_state = {
     "last_probs": {},
     "last_prices": {},
     "entry_prices": {},
+    "bought_at": {},
     "equity": 0.0,
     "cash": 0.0
 }
@@ -173,6 +181,50 @@ def load_weights_from_supabase():
         scaler = None
         is_trained = False
 
+
+def reload_portfolio_state():
+
+    print("🔄 Reloading portfolio state...")
+
+    try:
+
+        positions = api.list_positions()
+
+    except Exception as e:
+        print(f"[reload_portfolio_state] {e}")
+        return
+
+    now = time.time()
+
+    for pos in positions:
+
+        try:
+
+            symbol = pos.symbol
+
+            qty = int(pos.qty)
+
+            avg_entry = float(pos.avg_entry_price)
+
+            portfolio_state["positions"][symbol] = qty
+
+            # restore entry price
+            portfolio_state["entry_prices"][symbol] = avg_entry
+
+            # restore bought time if missing
+            if symbol not in portfolio_state["bought_at"]:
+
+                # assume recently loaded
+                portfolio_state["bought_at"][symbol] = now
+
+            print(
+                f"✅ Restored {symbol} "
+                f"qty={qty} entry={avg_entry}"
+            )
+
+        except Exception as e:
+
+            print(f"[reload symbol error] {e}")
 # =========================================================
 # MARKET CHECK
 # =========================================================
@@ -407,7 +459,7 @@ def rank_market():
         if x[1] >= THRESHOLD
     ]
     
-    return filtered[:MAX_POSITIONS]
+    # return filtered[:MAX_POSITIONS]
 
 # =========================================================
 # EXECUTION
@@ -474,7 +526,7 @@ def execute_portfolio(ranked):
             # ENTRY PRICE
             # =============================================
             entry_price = portfolio_state["entry_prices"].get(symbol)
-
+            pnl_pct = 0.0
             # =============================================
             # STOP LOSS
             # =============================================
@@ -482,7 +534,7 @@ def execute_portfolio(ranked):
 
                 pnl_pct = (live_price - entry_price) / entry_price
 
-                if pnl_pct <= -0.01:
+                if pnl_pct <= STOP_LOSS:
 
                     print(f"🛑 STOP LOSS SELL {symbol} pnl={pnl_pct:.3f}")
 
@@ -497,6 +549,7 @@ def execute_portfolio(ranked):
                         )
 
                         portfolio_state["entry_prices"].pop(symbol, None)
+                        portfolio_state["bought_at"].pop(symbol, None)
 
                     except Exception as e:
                         print(f"[STOP SELL ERROR] {symbol}: {e}")
@@ -524,6 +577,46 @@ def execute_portfolio(ranked):
 
             if target_qty < 1:
                 continue
+
+            # =============================================
+            # STALE POSITION CHECK
+            # =============================================
+            bought_at = portfolio_state["bought_at"].get(symbol)
+            
+            if qty > 0 and bought_at and entry_price:
+            
+                held_time = time.time() - bought_at
+            
+                pnl_pct = (live_price - entry_price) / entry_price
+            
+                if (
+                    held_time > STALE_TIME
+                    and -STALE_THRESHOLD < pnl_pct < STALE_THRESHOLD
+                ):
+            
+                    print(f"🔴 STALE SELL {symbol} pnl={pnl_pct:.3f}")
+            
+                    try:
+            
+                        api.submit_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side="sell",
+                            type="market",
+                            time_in_force="day"
+                        )
+            
+                        portfolio_state["entry_prices"].pop(symbol, None)
+                        portfolio_state["bought_at"].pop(symbol, None)
+            
+                        LAST_TRADE_TS[symbol] = time.time()
+            
+                        num_open -= 1
+            
+                    except Exception as e:
+                        print(f"[STALE SELL ERROR] {symbol}: {e}")
+            
+                    continue
 
             # =============================================
             # BUY
@@ -558,6 +651,7 @@ def execute_portfolio(ranked):
                     )
 
                     portfolio_state["entry_prices"][symbol] = live_price
+                    portfolio_state["bought_at"][symbol] = time.time()
 
                     LAST_TRADE_TS[symbol] = time.time()
 
@@ -569,7 +663,10 @@ def execute_portfolio(ranked):
             # =============================================
             # SELL
             # =============================================
-            elif qty > 0 and prob < 0.48:
+            elif qty > 0 and (
+                prob < 0.48
+                or pnl_pct >= TAKE_PROFIT
+            ):
 
                 print(f"🔴 SELL {symbol} prob={prob:.3f}")
 
@@ -584,6 +681,7 @@ def execute_portfolio(ranked):
                     )
 
                     portfolio_state["entry_prices"].pop(symbol, None)
+                    portfolio_state["bought_at"].pop(symbol, None)
 
                     LAST_TRADE_TS[symbol] = time.time()
 
@@ -842,7 +940,7 @@ def start():
 
     # Load weights first
     load_weights_from_supabase()
-
+    reload_portfolio_state()
     if model is None or scaler is None:
         print("🧠 No weights found → training fresh model")
         train()
