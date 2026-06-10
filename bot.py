@@ -49,7 +49,7 @@ SLIPPAGE = 0.001
 MAX_POSITIONS = 7
 MAX_EXPOSURE = 0.50
 
-THRESHOLD = 0.6
+THRESHOLD = 0.8
 
 RETRAIN_EVERY = 500
 SAVE_WEIGHTS_EVERY = 500
@@ -67,6 +67,7 @@ SIGNAL_CACHE_TTL = 60  # seconds (tune this)
 
 LAST_TRADE_TS = {}
 TRADE_COOLDOWN = 300
+MIN_HOLD_TIME = 3600
 
 STALE_TIME = 60 * 60 * 12
 STALE_THRESHOLD = 0.01
@@ -339,9 +340,16 @@ def build_dataset(df, min_window=60, max_index=None):
         volatility = df["close"].pct_change().rolling(20).std().iloc[i]
         
         threshold = max(0.0005, volatility * 0.5)
-        
-        
 
+        future = df["close"].iloc[i + LOOKAHEAD]
+        current = df["close"].iloc[i]
+        ret = (future / current) - 1
+        
+        volatility = df["close"].pct_change().rolling(20).std().iloc[i]
+        threshold = max(0.0005, volatility * 0.5)
+        
+        label = 1 if ret > threshold else 0
+        
         X.append(x)
         y.append(label)
 
@@ -682,6 +690,7 @@ def get_open_count():
 
 #                 print(f"🔴 SELL {symbol} prob={prob:.3f}")
 
+                
 #                 try:
 #                     api.submit_order(
 #                         symbol=symbol,
@@ -733,9 +742,6 @@ def execute_portfolio(ranked):
 
     usable_equity = equity * MAX_EXPOSURE
 
-    # -----------------------------
-    # SINGLE SOURCE OF TRUTH
-    # -----------------------------
     try:
         alpaca_positions = {p.symbol: p for p in api.list_positions()}
     except Exception as e:
@@ -747,17 +753,11 @@ def execute_portfolio(ranked):
     probs_snapshot = {}
     prices_snapshot = {}
 
-    # portfolio helpers
-    current_symbols = set(alpaca_positions.keys())
     current_count = len(alpaca_positions)
 
-    # rank incoming signals
     ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
-
-    # strongest candidates
     candidates = ranked[:MAX_POSITIONS]
 
-    # weakest current holdings (for replacement logic)
     def position_score(pos, price):
         try:
             entry = float(pos.avg_entry_price)
@@ -767,16 +767,18 @@ def execute_portfolio(ranked):
 
     weakest_positions = sorted(
         alpaca_positions.items(),
-        key=lambda x: position_score(x[1], prices_snapshot.get(x[0], 0.0))
+        key=lambda x: position_score(
+            x[1],
+            prices_snapshot.get(x[0], float(x[1].avg_entry_price))
+        )
     )
+    
+    price = prices_snapshot.get(x[0])
+    if price is None:
+        continue
 
-    # allocation model (dynamic)
-    remaining_slots = max(MAX_POSITIONS - current_count, 0)
     allocation_base = usable_equity / MAX_POSITIONS
 
-    # -----------------------------
-    # MAIN LOOP
-    # -----------------------------
     for symbol, prob, df in candidates:
 
         try:
@@ -790,24 +792,34 @@ def execute_portfolio(ranked):
             qty = int(pos.qty) if pos else 0
             entry_price = float(pos.avg_entry_price) if pos else None
 
-            # =========================================================
-            # DYNAMIC EDGE (core improvement)
-            # =========================================================
+            bought_at = portfolio_state["bought_at"].get(symbol)
+
+            # -------------------------------------------------
+            # HOLD LOGIC (ONLY AFFECTS SELLING)
+            # -------------------------------------------------
+            can_sell = True
+            if qty > 0 and bought_at:
+                held_time = now - bought_at
+                if held_time < MIN_HOLD_TIME:
+                    can_sell = False
+
+            # -------------------------------------------------
+            # EDGE + SIZE
+            # -------------------------------------------------
             edge = prob - 0.5
             if edge <= 0:
                 continue
 
             size_factor = min(max(edge * 2.5, 0.0), 1.0)
-
             target_value = allocation_base * size_factor
             target_qty = int(target_value / live_price)
 
             if target_qty < 1:
                 continue
 
-            # =========================================================
-            # STOP LOSS
-            # =========================================================
+            # -------------------------------------------------
+            # STOP LOSS (always allowed)
+            # -------------------------------------------------
             if qty > 0 and entry_price:
                 pnl_pct = (live_price - entry_price) / entry_price
 
@@ -831,35 +843,38 @@ def execute_portfolio(ranked):
 
                     continue
 
-            # =========================================================
+            # -------------------------------------------------
             # DRIFT FILTER
-            # =========================================================
+            # -------------------------------------------------
             model_price = float(df["close"].iloc[-1])
             drift = abs(live_price - model_price) / model_price
 
             if drift > 0.005:
                 continue
 
-            # =========================================================
-            # BUY / SCALE-IN
-            # =========================================================
+            # =================================================
+            # BUY LOGIC
+            # =================================================
             if qty == 0:
 
                 last_trade = LAST_TRADE_TS.get(symbol, 0)
                 if now - last_trade < TRADE_COOLDOWN:
                     continue
 
-                # REPLACEMENT LOGIC (IMPORTANT)
+                # replacement logic
                 if current_count >= MAX_POSITIONS:
 
                     weakest_symbol, weakest_pos = weakest_positions[0]
+
                     weakest_entry = float(weakest_pos.avg_entry_price)
-                    weakest_price = prices_snapshot.get(weakest_symbol, weakest_entry)
+                    weakest_price = prices_snapshot.get(
+                        weakest_symbol,
+                        weakest_entry
+                    )
 
                     weakest_score = (weakest_price - weakest_entry) / weakest_entry
                     new_score = edge
 
-                    # replace only if clearly better
                     if new_score <= weakest_score:
                         continue
 
@@ -894,21 +909,21 @@ def execute_portfolio(ranked):
                 except Exception as e:
                     print(f"[BUY ERROR] {symbol}: {e}")
 
-            # =========================================================
+            # =================================================
             # SELL LOGIC
-            # =========================================================
-            elif qty > 0:
+            # =================================================
+            elif qty > 0 and can_sell:
 
-                # model exit
-                if prob < 0.48:
-                    print(f"🔴 SELL {symbol} (low prob)")
-
-                # take profit
-                elif entry_price and (live_price - entry_price) / entry_price >= TAKE_PROFIT:
-                    print(f"💰 TAKE PROFIT {symbol}")
-
-                else:
+                if not entry_price:
                     continue
+
+                pnl_pct = (live_price - entry_price) / entry_price
+
+                # TAKE PROFIT ONLY (no immediate churn)
+                if pnl_pct < TAKE_PROFIT:
+                    continue
+
+                print(f"💰 TAKE PROFIT {symbol} pnl={pnl_pct:.3f}")
 
                 try:
                     api.submit_order(
@@ -930,9 +945,6 @@ def execute_portfolio(ranked):
         except Exception as e:
             print(f"[symbol loop error] {symbol}: {e}")
 
-    # -----------------------------
-    # FINAL STATE UPDATE
-    # -----------------------------
     portfolio_state.update({
         "positions": {s: int(p.qty) for s, p in alpaca_positions.items()},
         "last_probs": probs_snapshot,
@@ -942,6 +954,256 @@ def execute_portfolio(ranked):
     })
 
     print(f"💼 Equity: {equity:.2f} | Cash: {cash:.2f}")
+
+    # MOST RECENT
+# def execute_portfolio(ranked):
+
+#     try:
+#         account = api.get_account()
+#         equity = float(account.equity)
+#         cash = float(account.cash)
+#     except Exception as e:
+#         print(f"[execute_portfolio] account error: {e}")
+#         return
+
+#     portfolio_state["equity"] = equity
+#     portfolio_state["cash"] = cash
+
+#     usable_equity = equity * MAX_EXPOSURE
+
+#     # -----------------------------
+#     # SINGLE SOURCE OF TRUTH
+#     # -----------------------------
+#     try:
+#         alpaca_positions = {p.symbol: p for p in api.list_positions()}
+#     except Exception as e:
+#         print(f"[execute_portfolio] position fetch error: {e}")
+#         alpaca_positions = {}
+
+#     now = time.time()
+
+#     probs_snapshot = {}
+#     prices_snapshot = {}
+
+#     # portfolio helpers
+#     current_symbols = set(alpaca_positions.keys())
+#     current_count = len(alpaca_positions)
+
+#     # rank incoming signals
+#     ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
+
+#     # strongest candidates
+#     candidates = ranked[:MAX_POSITIONS]
+
+#     # weakest current holdings (for replacement logic)
+#     def position_score(pos, price):
+#         try:
+#             entry = float(pos.avg_entry_price)
+#             return (price - entry) / entry
+#         except:
+#             return 0.0
+
+#     weakest_positions = sorted(
+#         alpaca_positions.items(),
+#         key=lambda x: position_score(x[1], prices_snapshot.get(x[0], 0.0))
+#     )
+
+#     # allocation model (dynamic)
+#     remaining_slots = max(MAX_POSITIONS - current_count, 0)
+#     allocation_base = usable_equity / MAX_POSITIONS
+
+#     # -----------------------------
+#     # MAIN LOOP
+#     # -----------------------------
+#     for symbol, prob, df in candidates:
+
+#         try:
+#             trade = api.get_latest_trade(symbol)
+#             live_price = float(trade.price)
+
+#             probs_snapshot[symbol] = prob
+#             prices_snapshot[symbol] = live_price
+
+#             pos = alpaca_positions.get(symbol)
+#             qty = int(pos.qty) if pos else 0
+#             entry_price = float(pos.avg_entry_price) if pos else None
+
+#             bought_at = portfolio_state["bought_at"].get(symbol)
+#             allow_buy = False
+#             allow_sell = False
+#             if qty > 0 and bought_at:
+#                 held_time = now - bought_at
+            
+#                 if held_time < MIN_HOLD_TIME:
+#                     # Allow BUY logic if you want, but block SELL
+#                     allow_buy = True
+#                     allow_sell = False
+#                 else:
+#                     allow_buy = False
+#                     allow_sell = True
+#             else:
+#                 allow_buy = True
+#                 allow_sell = True
+
+#             # =========================================================
+#             # DYNAMIC EDGE (core improvement)
+#             # =========================================================
+#             edge = prob - 0.5
+#             if edge <= 0:
+#                 continue
+
+#             size_factor = min(max(edge * 2.5, 0.0), 1.0)
+
+#             target_value = allocation_base * size_factor
+#             target_qty = int(target_value / live_price)
+
+#             if target_qty < 1:
+#                 continue
+
+#             # =========================================================
+#             # STOP LOSS
+#             # =========================================================
+#             if qty > 0 and entry_price:
+#                 pnl_pct = (live_price - entry_price) / entry_price
+
+#                 if pnl_pct <= STOP_LOSS:
+#                     print(f"🛑 STOP LOSS SELL {symbol} pnl={pnl_pct:.3f}")
+
+#                     try:
+#                         api.submit_order(
+#                             symbol=symbol,
+#                             qty=qty,
+#                             side="sell",
+#                             type="market",
+#                             time_in_force="day"
+#                         )
+
+#                         portfolio_state["entry_prices"].pop(symbol, None)
+#                         portfolio_state["bought_at"].pop(symbol, None)
+
+#                     except Exception as e:
+#                         print(f"[STOP LOSS ERROR] {symbol}: {e}")
+
+#                     continue
+
+#             # =========================================================
+#             # DRIFT FILTER
+#             # =========================================================
+#             model_price = float(df["close"].iloc[-1])
+#             drift = abs(live_price - model_price) / model_price
+
+#             if drift > 0.005:
+#                 continue
+
+#             # =========================================================
+#             # BUY / SCALE-IN
+#             # =========================================================
+#             if qty == 0 and allow_buy:
+
+#                 last_trade = LAST_TRADE_TS.get(symbol, 0)
+#                 if now - last_trade < TRADE_COOLDOWN:
+#                     continue
+
+#                 # REPLACEMENT LOGIC (IMPORTANT)
+#                 if current_count >= MAX_POSITIONS:
+
+#                     weakest_symbol, weakest_pos = weakest_positions[0]
+#                     weakest_entry = float(weakest_pos.avg_entry_price)
+#                     weakest_price = prices_snapshot.get(weakest_symbol, weakest_entry)
+
+#                     weakest_score = (weakest_price - weakest_entry) / weakest_entry
+#                     new_score = edge
+
+#                     # replace only if clearly better
+#                     if new_score <= weakest_score:
+#                         continue
+
+#                     print(f"🔁 REPLACING {weakest_symbol} → {symbol}")
+
+#                     try:
+#                         api.submit_order(
+#                             symbol=weakest_symbol,
+#                             qty=int(weakest_pos.qty),
+#                             side="sell",
+#                             type="market",
+#                             time_in_force="day"
+#                         )
+#                     except Exception as e:
+#                         print(f"[REPLACE SELL ERROR] {weakest_symbol}: {e}")
+#                         continue
+
+#                 print(f"🟢 BUY {symbol} prob={prob:.3f} edge={edge:.3f}")
+
+#                 try:
+#                     api.submit_order(
+#                         symbol=symbol,
+#                         qty=target_qty,
+#                         side="buy",
+#                         type="market",
+#                         time_in_force="day"
+#                     )
+
+#                     portfolio_state["bought_at"][symbol] = now
+#                     LAST_TRADE_TS[symbol] = now
+
+#                 except Exception as e:
+#                     print(f"[BUY ERROR] {symbol}: {e}")
+
+#             # =========================================================
+#             # SELL LOGIC
+#             # =========================================================
+#             elif qty > 0 and allow_sell:
+
+#                 # model exit
+#                 # if prob < 0.48:
+#                 #     print(f"🔴 SELL {symbol} (low prob)")
+
+#                 # take profit
+#                 if entry_price and (live_price - entry_price) / entry_price >= TAKE_PROFIT:
+#                     print(f"💰 TAKE PROFIT {symbol}")
+
+#                 else:
+#                     continue
+
+#                 bought_at = portfolio_state["bought_at"].get(symbol)
+#                 if bought_at:
+#                     held_time = now - bought_at
+                
+#                     if held_time < MIN_HOLD_TIME:
+#                         print(f"Not held long enough, no sell")
+#                         continue
+#                 try:
+#                     api.submit_order(
+#                         symbol=symbol,
+#                         qty=qty,
+#                         side="sell",
+#                         type="market",
+#                         time_in_force="day"
+#                     )
+
+#                     portfolio_state["entry_prices"].pop(symbol, None)
+#                     portfolio_state["bought_at"].pop(symbol, None)
+
+#                     LAST_TRADE_TS[symbol] = now
+
+#                 except Exception as e:
+#                     print(f"[SELL ERROR] {symbol}: {e}")
+
+#         except Exception as e:
+#             print(f"[symbol loop error] {symbol}: {e}")
+
+#     # -----------------------------
+#     # FINAL STATE UPDATE
+#     # -----------------------------
+#     portfolio_state.update({
+#         "positions": {s: int(p.qty) for s, p in alpaca_positions.items()},
+#         "last_probs": probs_snapshot,
+#         "last_prices": prices_snapshot,
+#         "equity": equity,
+#         "cash": cash
+#     })
+
+#     print(f"💼 Equity: {equity:.2f} | Cash: {cash:.2f}")
 
 # # =========================================================
 # # EXECUTION
