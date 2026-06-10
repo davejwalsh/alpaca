@@ -773,10 +773,6 @@ def execute_portfolio(ranked):
         )
     )
     
-    price = prices_snapshot.get(x[0])
-    if price is None:
-        continue
-
     allocation_base = usable_equity / MAX_POSITIONS
 
     for symbol, prob, df in candidates:
