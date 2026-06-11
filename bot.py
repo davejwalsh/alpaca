@@ -256,7 +256,7 @@ def market_is_open():
             clock = api.get_clock()
             _cached_open = clock.is_open
             _last_clock_check = now
-             print("Continue 2")
+            print(f"Continue 2 {_cached_open}")
             return _cached_open
         except:
              print("Continue 3")
