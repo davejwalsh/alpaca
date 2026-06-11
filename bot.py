@@ -245,7 +245,7 @@ def reload_portfolio_state():
 # =========================================================
 def market_is_open():
     global _last_clock_check, _cached_open
-
+    print("Checking if open")
     with clock_lock:
         now = time.time()
         if now - _last_clock_check < 60:
