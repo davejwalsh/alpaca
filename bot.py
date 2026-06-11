@@ -253,8 +253,11 @@ def market_is_open():
             return _cached_open
         print("Continue 1")
         try:
+            print("Continue 1.0")
             clock = api.get_clock()
+            print("Continue 1.1")
             _cached_open = clock.is_open
+            print("Continue 1.2")
             _last_clock_check = now
             print(f"Continue 2 {_cached_open}")
             return _cached_open
