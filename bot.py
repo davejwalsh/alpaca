@@ -295,18 +295,58 @@ def market_is_open():
 # =========================================================
 # SAFE DATA
 # =========================================================
+# def get_bars(symbol, limit=1000):
+#     now = time.time()
+
+#     if len(BAR_CACHE) > 500:
+#         BAR_CACHE.clear()
+#         BAR_CACHE_TS.clear()
+
+#     if symbol in BAR_CACHE and now - BAR_CACHE_TS[symbol] < BAR_CACHE_TTL:
+#         return BAR_CACHE[symbol]
+
+#     try:
+#         bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit)
+#         df = bars.df.sort_index()
+
+#         BAR_CACHE[symbol] = df
+#         BAR_CACHE_TS[symbol] = now
+
+#         return df
+
+#     except Exception as e:
+#         print(f"[get_bars] error for {symbol}: {e}")
+#         return pd.DataFrame()
+
 def get_bars(symbol, limit=1000):
     now = time.time()
 
-    if len(BAR_CACHE) > 500:
-        BAR_CACHE.clear()
-        BAR_CACHE_TS.clear()
+    if symbol in BAR_CACHE:
+        age = now - BAR_CACHE_TS.get(symbol, 0)
 
-    if symbol in BAR_CACHE and now - BAR_CACHE_TS[symbol] < BAR_CACHE_TTL:
-        return BAR_CACHE[symbol]
+        if age < BAR_CACHE_TTL:
+            print(f"⚡ BAR CACHE {symbol}", flush=True)
+            return BAR_CACHE[symbol]
 
     try:
-        bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit)
+        print(f"🌐 Alpaca request {symbol}", flush=True)
+
+        start = time.time()
+
+        bars = api.get_bars(
+            symbol,
+            tradeapi.TimeFrame.Minute,
+            limit=limit
+        )
+
+        elapsed = time.time() - start
+
+        print(
+            f"✅ Alpaca response {symbol} "
+            f"({elapsed:.2f}s)",
+            flush=True
+        )
+
         df = bars.df.sort_index()
 
         BAR_CACHE[symbol] = df
@@ -315,7 +355,12 @@ def get_bars(symbol, limit=1000):
         return df
 
     except Exception as e:
-        print(f"[get_bars] error for {symbol}: {e}")
+
+        print(
+            f"❌ get_bars failed {symbol}: {e}",
+            flush=True
+        )
+
         return pd.DataFrame()
 
 # =========================================================
@@ -475,50 +520,194 @@ def predict(df):
 # =========================================================
 # RANK
 # =========================================================
+# def rank_market():
+#     scores = []
+#     cached = {}
+
+#     now = time.time()
+
+#     for s in SYMBOLS:
+#         df = get_bars(s)
+#         if df.empty or len(df) < 100:
+#             continue
+
+#         cached[s] = df
+
+#     for s, df in cached.items():
+
+#         # =====================================================
+#         # CACHE CHECK (NEW LOGIC)
+#         # =====================================================
+#         if s in SIGNAL_CACHE:
+#             if now - SIGNAL_CACHE_TS.get(s, 0) < SIGNAL_CACHE_TTL:
+#                 prob = SIGNAL_CACHE[s]
+#                 scores.append((s, prob, df))
+#                 continue
+
+#         # =====================================================
+#         # COMPUTE SIGNAL (ONLY IF NEEDED)
+#         # =====================================================
+#         prob = predict(df)
+
+#         SIGNAL_CACHE[s] = prob
+#         SIGNAL_CACHE_TS[s] = now
+
+#         scores.append((s, prob, df))
+
+#     scores.sort(key=lambda x: x[1], reverse=True)
+#     filtered = [
+#         x for x in scores
+#         if x[1] >= THRESHOLD
+#     ]
+
+#     print("SYMBOLS CHECKED:", len(SYMBOLS))
+#     print("SCORES BEFORE FILTER:", len(scores))
+#     print("THRESHOLD:", THRESHOLD)
+    
+#     return filtered[:MAX_POSITIONS]
+
 def rank_market():
+    print("📊 rank_market START", flush=True)
+
+    start_total = time.time()
+
     scores = []
     cached = {}
 
     now = time.time()
 
-    for s in SYMBOLS:
-        df = get_bars(s)
-        if df.empty or len(df) < 100:
-            continue
+    total_symbols = len(SYMBOLS)
 
-        cached[s] = df
+    # =====================================================
+    # FETCH DATA
+    # =====================================================
+    for i, s in enumerate(SYMBOLS, start=1):
 
-    for s, df in cached.items():
+        symbol_start = time.time()
 
-        # =====================================================
-        # CACHE CHECK (NEW LOGIC)
-        # =====================================================
-        if s in SIGNAL_CACHE:
-            if now - SIGNAL_CACHE_TS.get(s, 0) < SIGNAL_CACHE_TTL:
-                prob = SIGNAL_CACHE[s]
-                scores.append((s, prob, df))
+        try:
+            print(
+                f"📥 [{i}/{total_symbols}] Fetching bars for {s}",
+                flush=True
+            )
+
+            df = get_bars(s)
+
+            elapsed = time.time() - symbol_start
+
+            if df.empty:
+                print(
+                    f"⚠️ [{i}/{total_symbols}] {s} EMPTY "
+                    f"({elapsed:.2f}s)",
+                    flush=True
+                )
                 continue
 
-        # =====================================================
-        # COMPUTE SIGNAL (ONLY IF NEEDED)
-        # =====================================================
-        prob = predict(df)
+            if len(df) < 100:
+                print(
+                    f"⚠️ [{i}/{total_symbols}] {s} "
+                    f"only {len(df)} bars ({elapsed:.2f}s)",
+                    flush=True
+                )
+                continue
 
-        SIGNAL_CACHE[s] = prob
-        SIGNAL_CACHE_TS[s] = now
+            cached[s] = df
 
-        scores.append((s, prob, df))
+            print(
+                f"✅ [{i}/{total_symbols}] {s} "
+                f"{len(df)} bars ({elapsed:.2f}s)",
+                flush=True
+            )
 
+        except Exception as e:
+
+            print(
+                f"❌ [{i}/{total_symbols}] {s} fetch failed: {e}",
+                flush=True
+            )
+
+    print(
+        f"📦 Cached symbols: {len(cached)}",
+        flush=True
+    )
+
+    # =====================================================
+    # SCORE SYMBOLS
+    # =====================================================
+    for s, df in cached.items():
+
+        try:
+
+            # -------------------------------------------------
+            # CACHE HIT
+            # -------------------------------------------------
+            if s in SIGNAL_CACHE:
+
+                cache_age = now - SIGNAL_CACHE_TS.get(s, 0)
+
+                if cache_age < SIGNAL_CACHE_TTL:
+
+                    prob = SIGNAL_CACHE[s]
+
+                    scores.append((s, prob, df))
+
+                    print(
+                        f"⚡ CACHE {s} "
+                        f"prob={prob:.3f}",
+                        flush=True
+                    )
+
+                    continue
+
+            # -------------------------------------------------
+            # COMPUTE SIGNAL
+            # -------------------------------------------------
+            pred_start = time.time()
+
+            prob = predict(df)
+
+            pred_elapsed = time.time() - pred_start
+
+            SIGNAL_CACHE[s] = prob
+            SIGNAL_CACHE_TS[s] = now
+
+            scores.append((s, prob, df))
+
+            print(
+                f"🧠 PREDICT {s} "
+                f"prob={prob:.3f} "
+                f"({pred_elapsed:.3f}s)",
+                flush=True
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ Prediction failed for {s}: {e}",
+                flush=True
+            )
+
+    # =====================================================
+    # SORT + FILTER
+    # =====================================================
     scores.sort(key=lambda x: x[1], reverse=True)
+
     filtered = [
         x for x in scores
         if x[1] >= THRESHOLD
     ]
 
-    print("SYMBOLS CHECKED:", len(SYMBOLS))
-    print("SCORES BEFORE FILTER:", len(scores))
-    print("THRESHOLD:", THRESHOLD)
-    
+    total_elapsed = time.time() - start_total
+
+    print("======================================", flush=True)
+    print(f"SYMBOLS CONFIGURED : {len(SYMBOLS)}", flush=True)
+    print(f"SYMBOLS WITH DATA  : {len(cached)}", flush=True)
+    print(f"SCORES GENERATED   : {len(scores)}", flush=True)
+    print(f"PASSED THRESHOLD   : {len(filtered)}", flush=True)
+    print(f"THRESHOLD          : {THRESHOLD}", flush=True)
+    print(f"TOTAL TIME         : {total_elapsed:.2f}s", flush=True)
+    print("======================================", flush=True)
+
     return filtered[:MAX_POSITIONS]
 
 def get_open_count():
