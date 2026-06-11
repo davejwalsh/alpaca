@@ -481,6 +481,10 @@ def rank_market():
         x for x in scores
         if x[1] >= THRESHOLD
     ]
+
+    print("SYMBOLS CHECKED:", len(SYMBOLS))
+    print("SCORES BEFORE FILTER:", len(scores))
+    print("THRESHOLD:", THRESHOLD)
     
     return filtered[:MAX_POSITIONS]
 
@@ -1504,6 +1508,10 @@ def engine():
                 print("💾 Saving weights...")
 
                 save_weights_to_supabase()
+
+            print("TRAINED:", is_trained)
+            print("MODEL:", model)
+            print("SCALER:", scaler)
 
             time.sleep(CHECK_INTERVAL)
 
