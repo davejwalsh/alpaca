@@ -242,28 +242,54 @@ def reload_portfolio_state():
     print(f"🔄 Sync complete. Positions: {len(current_symbols)}")
 # =========================================================
 # MARKET CHECK
-# =========================================================
+# # =========================================================
+# def market_is_open():
+#     global _last_clock_check, _cached_open
+#     print("Checking if open")
+#     with clock_lock:
+#         print("in with")
+#         now = time.time()
+#         if now - _last_clock_check < 60:
+#             return _cached_open
+#         print("Continue 1")
+#         try:
+#             print("Continue 1.0")
+#             clock = api.get_clock()
+#             print("Continue 1.1")
+#             _cached_open = clock.is_open
+#             print("Continue 1.2")
+#             _last_clock_check = now
+#             print(f"Continue 2 {_cached_open}")
+#             return _cached_open
+#         except:
+#             print("Continue 3")
+#             return False
+
 def market_is_open():
     global _last_clock_check, _cached_open
+
     print("Checking if open")
+
+    now = time.time()
+
+    # fast path (no lock needed if stale check fails)
+    if now - _last_clock_check < 60:
+        return _cached_open
+
+    try:
+        print("Calling Alpaca clock API")
+        clock = api.get_clock()
+        result = clock.is_open
+    except Exception as e:
+        print("Clock API failed:", e)
+        return False
+
+    # ONLY lock shared state update
     with clock_lock:
-        print("in with")
-        now = time.time()
-        if now - _last_clock_check < 60:
-            return _cached_open
-        print("Continue 1")
-        try:
-            print("Continue 1.0")
-            clock = api.get_clock()
-            print("Continue 1.1")
-            _cached_open = clock.is_open
-            print("Continue 1.2")
-            _last_clock_check = now
-            print(f"Continue 2 {_cached_open}")
-            return _cached_open
-        except:
-            print("Continue 3")
-            return False
+        _cached_open = result
+        _last_clock_check = now
+
+    return result
 
 # =========================================================
 # SAFE DATA
