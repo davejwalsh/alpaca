@@ -1473,7 +1473,7 @@ def engine():
                 time.sleep(60)
                 continue
 
-            print(f"Is trained:" {is_trained}") 
+            print(f"Is trained: {is_trained}") 
             if not is_trained:
                 print("⚠️ Model not trained yet")
                 time.sleep(5)
