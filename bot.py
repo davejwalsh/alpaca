@@ -288,7 +288,7 @@ def market_is_open():
     with clock_lock:
         _cached_open = result
         _last_clock_check = now
-
+    print("returning")
     return result
 
 # =========================================================
