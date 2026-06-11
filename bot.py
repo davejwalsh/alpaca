@@ -247,16 +247,19 @@ def market_is_open():
     global _last_clock_check, _cached_open
     print("Checking if open")
     with clock_lock:
+        print("in with")
         now = time.time()
         if now - _last_clock_check < 60:
             return _cached_open
-
+        print("Continue 1")
         try:
             clock = api.get_clock()
             _cached_open = clock.is_open
             _last_clock_check = now
+             print("Continue 2")
             return _cached_open
         except:
+             print("Continue 3")
             return False
 
 # =========================================================
