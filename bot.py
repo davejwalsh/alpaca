@@ -266,30 +266,31 @@ def reload_portfolio_state():
 #             return False
 
 def market_is_open():
-    global _last_clock_check, _cached_open
+    return True
+    # global _last_clock_check, _cached_open
 
-    print("Checking if open")
+    # print("Checking if open")
 
-    now = time.time()
+    # now = time.time()
 
-    # fast path (no lock needed if stale check fails)
-    if now - _last_clock_check < 60:
-        return _cached_open
+    # # fast path (no lock needed if stale check fails)
+    # if now - _last_clock_check < 60:
+    #     return _cached_open
 
-    try:
-        print("Calling Alpaca clock API")
-        clock = api.get_clock()
-        result = clock.is_open
-    except Exception as e:
-        print("Clock API failed:", e)
-        return False
+    # try:
+    #     print("Calling Alpaca clock API")
+    #     clock = api.get_clock()
+    #     result = clock.is_open
+    # except Exception as e:
+    #     print("Clock API failed:", e)
+    #     return False
 
-    # ONLY lock shared state update
-    with clock_lock:
-        _cached_open = result
-        _last_clock_check = now
-    print("returning")
-    return result
+    # # ONLY lock shared state update
+    # with clock_lock:
+    #     _cached_open = result
+    #     _last_clock_check = now
+    # print("returning")
+    # return result
 
 # =========================================================
 # SAFE DATA
