@@ -259,7 +259,7 @@ def market_is_open():
             print(f"Continue 2 {_cached_open}")
             return _cached_open
         except:
-             print("Continue 3")
+            print("Continue 3")
             return False
 
 # =========================================================
