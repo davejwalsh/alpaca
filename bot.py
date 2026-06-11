@@ -1473,11 +1473,12 @@ def engine():
                 time.sleep(60)
                 continue
 
+            print(f"Is trained:" {is_trained}") 
             if not is_trained:
                 print("⚠️ Model not trained yet")
                 time.sleep(5)
                 continue
-
+            print("ranking...")
             ranked = rank_market()
 
             print(f"📊 Ranked symbols: {len(ranked)}")
