@@ -1467,12 +1467,12 @@ def engine():
         try:
 
             print("🔁 ENGINE LOOP")
-
+            print("Checking market")
             if not market_is_open():
                 print("🌙 Market closed — sleeping")
                 time.sleep(60)
                 continue
-
+            print("Checking market done")
             print(f"Is trained: {is_trained}") 
             if not is_trained:
                 print("⚠️ Model not trained yet")
@@ -1690,10 +1690,13 @@ def start():
     # Load weights first
     load_weights_from_supabase()
     reload_portfolio_state()
+    
     if model is None or scaler is None:
         print("🧠 No weights found → training fresh model")
         train()
         save_weights_to_supabase()
+    if model is not None:
+        is_trained = True
 
     # Start engine thread (TRADING LOOP)
     engine_thread = threading.Thread(target=run_engine, daemon=True)
