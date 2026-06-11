@@ -1912,7 +1912,7 @@ def start():
     # Load weights first
     load_weights_from_supabase()
     reload_portfolio_state()
-    
+    model = None
     if model is None or scaler is None:
         print("🧠 No weights found → training fresh model")
         train()
