@@ -466,7 +466,7 @@ def train_on_data(data_dict, end_idx=None):
     X_all_scaled = bt_scaler.transform(X_all)
 
     base = SGDClassifier(loss="log_loss", class_weight="balanced")
-    bt_model = CalibratedClassifierCV(base, method="isotonic", cv=3)
+    bt_model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
     bt_model.fit(X_all_scaled, y_all)
 
     return bt_model, bt_scaler
